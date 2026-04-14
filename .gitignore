@@ -1,0 +1,45 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Face enrollment files — personal biometric data
+*.pkl
+
+# Large model / embedding files
+*.npz
+*.pth
+clip_embeddings.npz
+aesthetic_model.pth
+
+# Logs
+logs/
+*.log
+
+# Output folders — copied photos, never source-controlled
+output/
+
+# Pipeline JSON outputs — large and fully regeneratable
+surviving_photos*.json
+enriched_photos*.json
+scored_photos*.json
+selected_photos*.json
+
+# Review state — personal, machine-specific
+review_progress.json
+
+# Scan report outputs — regeneratable
+scan_report.txt
+scan_report.json
+
+# Phase 3 checkpoint — regeneratable
+phase3_checkpoint.json
+
+# Personal reference photos for face enrollment
+reference_photos/
+
+# Claude Code internal files
+.claude/
