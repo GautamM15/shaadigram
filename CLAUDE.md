@@ -1,16 +1,16 @@
 # Wedding Photo Curator — Claude Code Rules
 
 ## Current Status
-- Last completed: Pre-21k improvements ✅ (all 3 built and verified, 2026-04-14)
-- phase1_filter.py ✅ — + --scan-report (Pass A filename dedup + Pass B phash dedup + step1_ingest pre-filter)
-- phase2_enrich.py ✅ — + capture_time field + MOMENT_SUBFOLDER_FALLBACK subfolder moment assignment
-- phase1b_burst.py ✅ — new burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
+- Last completed: Phase 2/3/4 upgrades ✅ (CLIP, LAION, composition, MMR — 2026-04-14)
+- phase2_enrich.py ✅ — +step6_clip_embeddings() ViT-B/32, batch=32, clip_embeddings.npz, clip_event_tags, --skip-clip
+- phase3_score.py ✅ — +LAION aesthetic (ViT-L/14+MLP, fallback BRISQUE), +composition (rot/prominence/distraction), +burst compare (LLaVA grid, burst_rank), updated formula, --skip-composition flag
+- phase4_select.py ✅ — +MMR selection (lambda=0.7, CLIP embeddings, moment cap), --no-mmr flag, mmr_score field
+- config.py ✅ — EMOTION_WEIGHT 0.40→0.35, +LAION_WEIGHT/ROT_WEIGHT/PROMINENCE_WEIGHT/DISTRACTION_PENALTY/BURST_RANK_BONUS/PENALTY/CLIP_*/MMR_LAMBDA
+- phase1_filter.py ✅ — --scan-report (Pass A filename dedup + Pass B phash dedup + step1_ingest pre-filter)
+- phase1b_burst.py ✅ — burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
 - run_pipeline.py ✅ — 7-phase pipeline runner (--from/--only/--skip-review/--dry-run)
-- phase5_review.py ✅ — tkinter review UI: StartupDialog + ReviewApp, 3-col grid, background loads, filter panel, atomic progress save, export to album_approved/ + person_highlights/
-- phase4_select.py ✅ — selected_photos_candid.json: 800 in top800, rank 1 score=0.825
-- phase3_score.py ✅ — scored_photos_candid.json: 1,476 scored, mean 0.6464, median 0.6750
-- phase2_enrich.py — needs re-run on full 21k dataset (capture_time + subfolder fallback are new)
-- Next: Run full 21k pipeline starting with phase1_filter.py --scan-report
+- phase5_review.py ✅ — tkinter review UI
+- Next: LAION model download then full 21k pipeline run (see Phase Order below)
 
 ## Non-Negotiable Rules
 - NEVER delete, move, or modify original photo files
@@ -46,12 +46,16 @@
 - All outputs are copies — originals on hard drive are never touched
 
 ## Phase Order
-1. phase1_filter.py --scan-report  (run first — generates scan_report.json for pre-filtering)
+0. Download LAION model: save sa_0_4_vit_l_14_linear.pth as aesthetic_model.pth in project root
+1. phase1_filter.py --scan-report  (generates scan_report.json for pre-filtering)
 2. phase1_filter.py                (full filter run; reads scan_report.json automatically)
-3. phase2_enrich.py                (EXIF moments + capture_time + subfolder fallback + faces)
+3. phase2_enrich.py                (EXIF moments + capture_time + subfolder fallback + faces + CLIP embeddings)
+   - use --skip-clip if transformers not installed; CLIP embeddings needed for MMR in phase4
 4. phase1b_burst.py                (burst limiter — runs between phase2 and phase3)
-5. phase3_score.py                 (NIMA + LLaVA scoring)
-6. phase4_select.py                (moment-balanced top-800 selection)
+5. phase3_score.py                 (LAION/BRISQUE + composition + LLaVA + burst compare)
+   - use --skip-nima to skip LAION and use BRISQUE (same as before)
+   - use --skip-composition if cv2 saliency unavailable
+6. phase4_select.py                (MMR-balanced top-800 selection; --no-mmr for greedy fallback)
 7. phase5_review.py                (keyboard-driven review UI)
 8. phase6_export.py                (copy finals to output folders)
 

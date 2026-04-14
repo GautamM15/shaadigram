@@ -30,10 +30,47 @@ FACE_MATCH_THRESHOLD = 0.4
 MANUAL_PERSON_REVIEW = ["gautam"]   # persons identified manually in phase 5 review UI
 
 # Phase 3 — scoring weights (must sum to 1.0)
-NIMA_WEIGHT = 0.25
-EMOTION_WEIGHT = 0.40
-LIGHTING_WEIGHT = 0.20
+# New formula: LAION(0.25) + emotion(0.35) + memorability(0.15) + rot(0.10) + prominence(0.15) = 1.00
+NIMA_WEIGHT         = 0.25   # kept for backward compat with old scored JSONs
+EMOTION_WEIGHT      = 0.35
 MEMORABILITY_WEIGHT = 0.15
+# LIGHTING_WEIGHT removed — replaced by ROT_WEIGHT + PROMINENCE_WEIGHT
+
+# Phase 3 — LAION aesthetic predictor
+LAION_WEIGHT        = 0.25   # replaces NIMA_WEIGHT in new formula
+LAION_MODEL_PATH    = "aesthetic_model.pth"   # download sa_0_4_vit_l_14_linear.pth from LAION GitHub
+
+# Phase 3 — Composition scoring
+ROT_WEIGHT          = 0.10   # rule-of-thirds face alignment
+PROMINENCE_WEIGHT   = 0.15   # dominant face bbox fraction
+DISTRACTION_PENALTY = 0.90   # multiplier when saliency peak far from all faces
+
+# Phase 3 — LLaVA burst comparison
+BURST_RANK_BONUS    = [1.15, 1.05]   # emotion_score multiplier for rank-1 and rank-2
+BURST_RANK_PENALTY  = 0.95           # emotion_score multiplier for rank-3+
+
+# Phase 2 / Phase 4 — CLIP embeddings
+CLIP_MODEL              = "openai/clip-vit-base-patch32"
+CLIP_EMBEDDINGS_FILE    = "clip_embeddings.npz"
+CLIP_BATCH_SIZE         = 32
+CLIP_EVENT_PROMPTS      = [
+    "wedding ceremony",
+    "baraat procession",
+    "haldi ceremony",
+    "mehendi ceremony",
+    "sangeet dance",
+    "cocktail party",
+    "bride getting ready",
+    "groom getting ready",
+    "couple portrait",
+    "group family photo",
+    "wedding decor flowers",
+    "wedding reception",
+]
+
+# Phase 4 — MMR diversity selection
+MMR_LAMBDA              = 0.7   # 0 = pure diversity, 1 = pure score
+PHASE4_CLIP_EMBEDDINGS  = CLIP_EMBEDDINGS_FILE
 
 # Phase 3 — I/O paths
 PHASE3_INPUT  = "enriched_photos_candid.json"

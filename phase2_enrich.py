@@ -26,6 +26,14 @@ from tqdm import tqdm
 import config
 from utils import get_exif_timestamp, load_json, save_json, setup_logging
 
+# ── Optional CLIP imports (phase 2 step 6) ────────────────────────────────────
+try:
+    import torch
+    from transformers import CLIPModel as _CLIPFullModel, CLIPImageProcessor, CLIPTokenizerFast
+    _CLIP_AVAILABLE = True
+except ImportError:
+    _CLIP_AVAILABLE = False
+
 # Statuses that go through full enrichment
 _SURVIVING = {"surviving", "soft_blur_surviving"}
 
@@ -46,6 +54,7 @@ _NULL_ENRICHMENT = {
     "max_smile_score":  None,
     "has_closed_eyes":  False,
     "confusion_warning": False,
+    "clip_event_tags":   [],
 }
 
 # OpenCV eye cascade — bundled with opencv-python
@@ -584,9 +593,243 @@ def step3_4_5_enrich(records: list, enrollments: dict, logger,
     return records
 
 
-# ── Step 6 — Output + summary ─────────────────────────────────────────────────
+# ── Step 6 — CLIP embeddings + event tags ─────────────────────────────────────
 
-def step6_output(records: list, logger, output_path: str) -> None:
+def _load_clip_model(logger) -> tuple:
+    """Load CLIP ViT-B/32 onto GPU (or CPU) via transformers.
+
+    Args:
+        logger: Logger instance.
+
+    Returns:
+        Tuple (model, processor, device) on success, or (None, None, None)
+        if transformers / torch are unavailable.
+    """
+    if not _CLIP_AVAILABLE:
+        logger.warning("CLIP unavailable (transformers or torch missing) -- step 6 skipped")
+        return None, None, None
+    try:
+        device         = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("Loading CLIP model %s on %s ...", config.CLIP_MODEL, device)
+        img_processor  = CLIPImageProcessor.from_pretrained(config.CLIP_MODEL)
+        txt_tokenizer  = CLIPTokenizerFast.from_pretrained(config.CLIP_MODEL)
+        model          = _CLIPFullModel.from_pretrained(config.CLIP_MODEL).to(device)
+        model.eval()
+        # Store tokenizer as a convenience attribute for text encoding
+        model._txt_tokenizer = txt_tokenizer
+        logger.info("CLIP model loaded")
+        return model, img_processor, device
+    except Exception as exc:
+        logger.warning("CLIP model load failed (%s) -- step 6 skipped", exc)
+        return None, None, None
+
+
+def _embed_batch(model, processor, pil_images: list, device: str) -> np.ndarray:
+    """Encode a batch of PIL images with CLIP visual encoder.
+
+    Args:
+        model:      CLIPModel instance.
+        processor:  CLIPProcessor instance.
+        pil_images: List of PIL.Image objects (RGB).
+        device:     "cuda" or "cpu".
+
+    Returns:
+        Float32 numpy array of shape (B, 512), L2-normalised.
+    """
+    import torch
+    inputs = processor(images=pil_images, return_tensors="pt")
+    pv     = inputs["pixel_values"].to(device)
+    with torch.no_grad():
+        vis_out = model.vision_model(pixel_values=pv)
+        feats   = model.visual_projection(vis_out.pooler_output)  # (B, 512)
+    feats = feats.cpu().float().numpy()
+    norms = np.linalg.norm(feats, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return feats / norms
+
+
+def _encode_text_prompts(model, processor, prompts: list, device: str) -> np.ndarray:
+    """Encode a list of text prompts with CLIP text encoder.
+
+    Args:
+        model:     CLIPModel instance.
+        processor: CLIPProcessor instance.
+        prompts:   List of text strings.
+        device:    "cuda" or "cpu".
+
+    Returns:
+        Float32 numpy array of shape (P, 512), L2-normalised.
+    """
+    import torch
+    tokenizer = getattr(model, "_txt_tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("model._txt_tokenizer not set — call _load_clip_model() first")
+    inputs = tokenizer(text=prompts, return_tensors="pt", padding=True, truncation=True)
+    ii = inputs["input_ids"].to(device)
+    am = inputs["attention_mask"].to(device)
+    with torch.no_grad():
+        txt_out = model.text_model(input_ids=ii, attention_mask=am)
+        feats   = model.text_projection(txt_out.pooler_output)  # (P, 512)
+    feats = feats.cpu().float().numpy()
+    norms = np.linalg.norm(feats, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return feats / norms
+
+
+def _classify_clip_event(embedding: np.ndarray,
+                          text_embeddings: np.ndarray,
+                          prompts: list) -> list:
+    """Return top-2 event labels for one image embedding.
+
+    Args:
+        embedding:       (512,) unit-normalised float32 array.
+        text_embeddings: (P, 512) unit-normalised float32 array.
+        prompts:         List of prompt strings (length P).
+
+    Returns:
+        List of up to 2 label strings (spaces replaced with underscores).
+    """
+    sims = text_embeddings @ embedding   # (P,)
+    top_idx = np.argsort(sims)[::-1][:2]
+    return [prompts[i].replace(" ", "_") for i in top_idx]
+
+
+def step6_clip_embeddings(records: list, logger,
+                           output_path: str,
+                           skip_clip: bool = False) -> list:
+    """Generate CLIP embeddings and zero-shot event tags for all surviving photos.
+
+    Embeds images using CLIP ViT-B/32 in batches of CLIP_BATCH_SIZE.  Saves
+    all embeddings to CLIP_EMBEDDINGS_FILE (.npz) and writes clip_event_tags
+    (top-2 labels) back into each JSON record.
+
+    Non-surviving records and error photos receive clip_event_tags=[].
+
+    Args:
+        records:     All phase-2 records (enriched through step 5).
+        logger:      Logger instance.
+        output_path: Path to clip_embeddings.npz output file.
+        skip_clip:   If True, skip this step entirely.
+
+    Returns:
+        Records list with clip_event_tags populated for surviving photos.
+    """
+    if skip_clip:
+        logger.info("Step 6 -- CLIP skipped (--skip-clip flag)")
+        print("\nStep 6: CLIP skipped")
+        for r in records:
+            r.setdefault("clip_event_tags", [])
+        return records
+
+    model, processor, device = _load_clip_model(logger)
+    if model is None:
+        logger.warning("Step 6 -- CLIP model unavailable; clip_event_tags set to []")
+        print("\nStep 6: CLIP unavailable -- skipping")
+        for r in records:
+            r.setdefault("clip_event_tags", [])
+        return records
+
+    surviving = [r for r in records if r.get("status") in {"surviving", "soft_blur_surviving"}]
+    logger.info(
+        "Step 6 -- CLIP embeddings  model=%s  photos=%d  batch=%d  device=%s",
+        config.CLIP_MODEL, len(surviving), config.CLIP_BATCH_SIZE, device,
+    )
+    print(
+        f"\nStep 6: CLIP embeddings  photos={len(surviving)}"
+        f"  batch={config.CLIP_BATCH_SIZE}  device={device}"
+    )
+
+    # Encode all event-prompt text embeddings once
+    text_embs = _encode_text_prompts(
+        model, processor, config.CLIP_EVENT_PROMPTS, device
+    )
+
+    all_paths  = []
+    all_embs   = []
+    errors     = 0
+
+    batch_size = config.CLIP_BATCH_SIZE
+    for batch_start in tqdm(
+        range(0, len(surviving), batch_size),
+        desc="CLIP embedding",
+        unit="batch",
+    ):
+        batch = surviving[batch_start: batch_start + batch_size]
+        pil_imgs    = []
+        valid_batch = []
+        for r in batch:
+            try:
+                img = Image.open(r["path"]).convert("RGB")
+                pil_imgs.append(img)
+                valid_batch.append(r)
+            except Exception as exc:
+                logger.warning("CLIP: could not open %s: %s", r["path"], exc)
+                r["clip_event_tags"] = []
+                errors += 1
+
+        if not pil_imgs:
+            continue
+
+        try:
+            embs = _embed_batch(model, processor, pil_imgs, device)
+        except Exception as exc:
+            logger.warning("CLIP batch failed at index %d: %s", batch_start, exc)
+            for r in valid_batch:
+                r["clip_event_tags"] = []
+                errors += 1
+            continue
+
+        for r, emb in zip(valid_batch, embs):
+            r["clip_event_tags"] = _classify_clip_event(
+                emb, text_embs, config.CLIP_EVENT_PROMPTS
+            )
+            all_paths.append(r["path"])
+            all_embs.append(emb)
+
+    # Ensure non-surviving records have the field
+    for r in records:
+        r.setdefault("clip_event_tags", [])
+
+    # Save .npz
+    if all_embs:
+        np.savez(
+            output_path,
+            paths=np.array(all_paths),
+            embeddings=np.array(all_embs, dtype=np.float32),
+        )
+        logger.info("Saved clip_embeddings.npz: %d embeddings → %s", len(all_embs), output_path)
+
+    # Free GPU memory before LLaVA / other phases
+    import gc
+    del model, processor
+    if _CLIP_AVAILABLE:
+        try:
+            import torch as _t
+            _t.cuda.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+
+    # Tag summary
+    from collections import Counter
+    tag_counts = Counter(
+        tag
+        for r in records
+        for tag in (r.get("clip_event_tags") or [])
+    )
+    top_tags = "  ".join(f"{t}({c})" for t, c in tag_counts.most_common(5))
+    logger.info(
+        "Step 6 complete -- %d embedded  %d errors  top tags: %s",
+        len(all_embs), errors, top_tags,
+    )
+    print(f"\n  CLIP: {len(all_embs)} embedded  {errors} errors")
+    print(f"  Top event tags: {top_tags}")
+    return records
+
+
+# ── Step 7 — Output + summary ─────────────────────────────────────────────────
+
+def step7_output(records: list, logger, output_path: str) -> None:
     """Save enriched records to JSON and print a summary table.
 
     Args:
@@ -800,6 +1043,12 @@ def main():
         metavar="IMAGE_PATH",
         help="Run face detection on one photo and print similarity scores against all enrolled persons",
     )
+    parser.add_argument(
+        "--skip-clip",
+        action="store_true",
+        dest="skip_clip",
+        help="Skip CLIP embedding step (step 6); clip_event_tags will be [] for all photos",
+    )
     args = parser.parse_args()
 
     logger = setup_logging("phase2_enrich")
@@ -811,9 +1060,9 @@ def main():
     start  = time.time()
     logger.info(
         "=== Phase 2 started  input=%s  output=%s  test=%s  "
-        "include_emotion=%s  debug_face=%s ===",
+        "include_emotion=%s  debug_face=%s  skip_clip=%s ===",
         args.input, args.output, args.test,
-        args.include_emotion, args.debug_face,
+        args.include_emotion, args.debug_face, args.skip_clip,
     )
 
     records = load_json(args.input)
@@ -837,7 +1086,12 @@ def main():
         include_emotion=args.include_emotion,
         debug_face=args.debug_face,
     )
-    step6_output(records, logger, args.output)
+    records     = step6_clip_embeddings(
+        records, logger,
+        output_path=config.CLIP_EMBEDDINGS_FILE,
+        skip_clip=args.skip_clip,
+    )
+    step7_output(records, logger, args.output)
 
     elapsed = time.time() - start
     logger.info("=== Phase 2 complete in %.1fs ===", elapsed)

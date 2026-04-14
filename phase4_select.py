@@ -19,6 +19,8 @@ import os
 import time
 from collections import defaultdict
 
+import numpy as np
+
 import config
 from utils import load_json, save_json, setup_logging
 
@@ -64,62 +66,231 @@ def step1_load_validate(input_path: str, logger) -> tuple:
     return all_records, eligible
 
 
+# ── CLIP embedding helpers ────────────────────────────────────────────────────
+
+def _load_clip_embeddings(emb_path: str, records: list, logger) -> dict:
+    """Load CLIP embeddings from a .npz file and build a path→embedding dict.
+
+    The .npz file must have two arrays:
+        paths      — shape (N,) string array of absolute image paths
+        embeddings — shape (N, 512) float32 unit-normalised embeddings
+
+    Args:
+        emb_path: Path to clip_embeddings.npz.
+        records:  All eligible records (used to validate coverage).
+        logger:   Logger instance.
+
+    Returns:
+        Dict mapping image path (str) to unit-normalised float32 numpy array,
+        or None if the file is missing, corrupt, or covers fewer than 50% of
+        eligible records (indicating a stale/partial embedding run).
+    """
+    if not os.path.exists(emb_path):
+        logger.info("CLIP embeddings file not found (%s) -- MMR disabled", emb_path)
+        return None
+
+    try:
+        data   = np.load(emb_path, allow_pickle=True)
+        paths  = data["paths"]
+        embs   = data["embeddings"].astype(np.float32)
+        if len(paths) != len(embs):
+            raise ValueError("paths/embeddings array length mismatch")
+    except Exception as exc:
+        logger.warning("CLIP embeddings load failed (%s) -- MMR disabled", exc)
+        return None
+
+    path_to_emb = {str(p): embs[i] for i, p in enumerate(paths)}
+
+    # Coverage check
+    eligible_paths  = {r["path"] for r in records}
+    covered         = sum(1 for p in eligible_paths if p in path_to_emb)
+    coverage_pct    = covered / max(len(eligible_paths), 1) * 100
+
+    if coverage_pct < 50:
+        logger.warning(
+            "CLIP embeddings cover only %.0f%% of eligible photos -- MMR disabled",
+            coverage_pct,
+        )
+        return None
+
+    logger.info(
+        "CLIP embeddings loaded: %d vectors  coverage=%.0f%%  file=%s",
+        len(path_to_emb), coverage_pct, emb_path,
+    )
+    print(f"\nCLIP embeddings: {len(path_to_emb)} vectors  coverage={coverage_pct:.0f}%")
+    return path_to_emb
+
+
+def _mmr_select(candidates: list, embeddings: dict, n: int,
+                 lambda_: float, moment_count_fn, logger) -> list:
+    """Select n photos using Maximal Marginal Relevance (MMR).
+
+    MMR balances quality (final_score) against visual diversity (CLIP cosine
+    similarity to already-selected photos):
+
+        mmr_score = lambda_ × final_score
+                  − (1 − lambda_) × max_cosine_sim_to_selected
+
+    For the first pick max_cosine_sim_to_selected = 0 so the highest-scoring
+    photo is always selected first.
+
+    Moment caps are enforced: moment_count_fn(record) returns True when a
+    candidate has already reached its cap and must be skipped.
+
+    Args:
+        candidates:     List of eligible record dicts with final_score and path.
+        embeddings:     Dict of path → unit-normalised float32 (512,) embedding.
+        n:              Target number of photos to select.
+        lambda_:        MMR trade-off (0 = pure diversity, 1 = pure score).
+        moment_count_fn: Callable(record) → bool — True means "skip (capped)".
+        logger:          Logger instance.
+
+    Returns:
+        List of selected record dicts (up to n), in selection order.
+    """
+    remaining  = list(candidates)
+    selected   = []
+    sel_embs   = []   # list of (512,) arrays for dot-product batch
+
+    for _ in range(n):
+        if not remaining:
+            break
+
+        best_score = -1e9
+        best_idx   = -1
+
+        # Build (M, 512) matrix from selected embeddings for batch cosine sim
+        if sel_embs:
+            sel_matrix = np.stack(sel_embs, axis=0)   # (K, 512)
+
+        for i, rec in enumerate(remaining):
+            if moment_count_fn(rec):
+                continue
+
+            fs = rec.get("final_score", 0.0) or 0.0
+
+            if not sel_embs:
+                mmr = lambda_ * fs
+            else:
+                emb = embeddings.get(rec["path"])
+                if emb is None:
+                    # No embedding — treat max_sim as 0 (compete as if novel)
+                    max_sim = 0.0
+                else:
+                    sims    = sel_matrix @ emb   # (K,)
+                    max_sim = float(sims.max())
+
+                mmr = lambda_ * fs - (1.0 - lambda_) * max_sim
+
+            if mmr > best_score:
+                best_score = mmr
+                best_idx   = i
+
+        if best_idx == -1:
+            break   # all remaining are capped
+
+        chosen = remaining.pop(best_idx)
+        chosen["mmr_score"] = round(best_score, 6)
+        selected.append(chosen)
+
+        emb = embeddings.get(chosen["path"])
+        if emb is not None:
+            sel_embs.append(emb)
+
+    logger.info("MMR selection: selected %d / %d target", len(selected), n)
+    return selected
+
+
 # ── Step 2 — Moment-balanced top-800 selection ────────────────────────────────
 
-def step2_moment_balanced_selection(eligible: list, logger) -> list:
-    """Select up to TOP_N_ALBUM photos using moment-balanced greedy selection.
+def step2_moment_balanced_selection(eligible: list, logger,
+                                     embeddings: dict = None) -> list:
+    """Select up to TOP_N_ALBUM photos using moment-balanced selection.
 
-    Algorithm:
-        1. Sort eligible photos by final_score descending (stable).
-        2. Walk the sorted list; for each photo:
-           - If moment_label == "unknown" (no EXIF): always accept — no cap.
-           - Else: accept only if moment_count[moment_id] < MAX_PHOTOS_PER_MOMENT.
-        3. Stop when TOP_N_ALBUM selected or list exhausted.
+    When CLIP embeddings are available (embeddings dict passed), uses Maximal
+    Marginal Relevance (MMR) with lambda=MMR_LAMBDA for diversity-aware
+    selection.  Falls back to greedy score-ordered selection when embeddings
+    are None.
+
+    Moment cap (MAX_PHOTOS_PER_MOMENT) is enforced in both modes.
+    Photos with moment_label=="unknown" (no EXIF) are never capped.
 
     Sets on each eligible record:
         in_top800      (bool)
         selection_rank (int or None)
+        mmr_score      (float or None — only set in MMR mode)
 
     Args:
-        eligible: Eligible records (status in _SURVIVING, final_score set).
-        logger:   Logger instance.
+        eligible:   Eligible records (status in _SURVIVING, final_score set).
+        logger:     Logger instance.
+        embeddings: Optional dict of path → float32 (512,) CLIP embedding.
 
     Returns:
-        eligible list with in_top800 and selection_rank populated.
+        eligible list with in_top800, selection_rank (and optionally mmr_score)
+        populated.
     """
-    # Initialise all eligible with defaults so every record has the fields set
-    # regardless of whether the loop reaches them.
+    # Initialise all eligible with defaults
     for record in eligible:
         record["in_top800"]      = False
         record["selection_rank"] = None
+        record.setdefault("mmr_score", None)
 
-    sorted_eligible = sorted(
-        eligible, key=lambda r: r.get("final_score", 0.0), reverse=True
-    )
+    moment_counts: dict = defaultdict(int)
 
-    moment_counts: dict = defaultdict(int)  # moment_id → photos selected so far
-    selected    = 0
-    skipped_cap = 0
+    def _is_capped(rec: dict) -> bool:
+        """Return True if this record would exceed its moment cap."""
+        lbl = rec.get("moment_label") or "unknown"
+        mid = rec.get("moment_id")
+        if lbl == "unknown":
+            return False
+        return moment_counts[mid] >= config.MAX_PHOTOS_PER_MOMENT
 
-    for record in sorted_eligible:
-        if selected >= config.TOP_N_ALBUM:
-            break
+    def _register(rec: dict) -> None:
+        """Increment the moment counter for a just-selected record."""
+        lbl = rec.get("moment_label") or "unknown"
+        mid = rec.get("moment_id")
+        if lbl != "unknown":
+            moment_counts[mid] += 1
 
-        moment_label = record.get("moment_label") or "unknown"
-        moment_id    = record.get("moment_id")
+    use_mmr = embeddings is not None
+    mode    = "MMR" if use_mmr else "greedy"
+    logger.info("Step 2 -- selection mode=%s  target=%d", mode, config.TOP_N_ALBUM)
+    print(f"\nStep 2: selection  mode={mode}  target={config.TOP_N_ALBUM}")
 
-        if moment_label == "unknown":
-            # No EXIF timestamp — competes freely, no moment cap applied
-            pass
-        else:
-            if moment_counts[moment_id] >= config.MAX_PHOTOS_PER_MOMENT:
+    if use_mmr:
+        selected_records = _mmr_select(
+            candidates     = sorted(eligible, key=lambda r: r.get("final_score", 0.0), reverse=True),
+            embeddings     = embeddings,
+            n              = config.TOP_N_ALBUM,
+            lambda_        = config.MMR_LAMBDA,
+            moment_count_fn= _is_capped,
+            logger         = logger,
+        )
+        # Register moment counts and set fields
+        for rank, rec in enumerate(selected_records, 1):
+            _register(rec)
+            rec["in_top800"]      = True
+            rec["selection_rank"] = rank
+        selected = len(selected_records)
+        skipped_cap = 0   # MMR loop already respects caps via moment_count_fn
+    else:
+        # Greedy score-ordered selection (original behaviour)
+        sorted_eligible = sorted(
+            eligible, key=lambda r: r.get("final_score", 0.0), reverse=True
+        )
+        selected    = 0
+        skipped_cap = 0
+
+        for record in sorted_eligible:
+            if selected >= config.TOP_N_ALBUM:
+                break
+            if _is_capped(record):
                 skipped_cap += 1
                 continue
-            moment_counts[moment_id] += 1
-
-        selected += 1
-        record["in_top800"]      = True
-        record["selection_rank"] = selected
+            _register(record)
+            selected += 1
+            record["in_top800"]      = True
+            record["selection_rank"] = selected
 
     if selected < config.TOP_N_ALBUM:
         logger.warning(
@@ -140,12 +311,12 @@ def step2_moment_balanced_selection(eligible: list, logger) -> list:
         moment_summary = "all unknown (no EXIF — no cap applied)"
 
     logger.info(
-        "Step 2 -- selection complete  selected=%d  skipped_cap=%d  moments=[%s]",
-        selected, skipped_cap, moment_summary,
+        "Step 2 -- selection complete  mode=%s  selected=%d  skipped_cap=%d  moments=[%s]",
+        mode, selected, skipped_cap, moment_summary,
     )
     print(
         f"\nStep 2: selected {selected}/{config.TOP_N_ALBUM}  "
-        f"skipped_cap={skipped_cap}  [{moment_summary}]"
+        f"mode={mode}  skipped_cap={skipped_cap}  [{moment_summary}]"
     )
     return eligible
 
@@ -217,6 +388,7 @@ def step4_output(all_records: list, eligible: list,
         if record["path"] not in eligible_paths:
             record["in_top800"]      = False
             record["selection_rank"] = None
+            record.setdefault("mmr_score", None)
 
     save_json(output_path, all_records)
     logger.info("Saved %s  (%d records)", output_path, len(all_records))
@@ -224,6 +396,8 @@ def step4_output(all_records: list, eligible: list,
     # ── Build summary ─────────────────────────────────────────────────────────
     top800 = [r for r in eligible if r.get("in_top800")]
     n_top  = len(top800)
+
+    mmr_used = any(r.get("mmr_score") is not None for r in top800)
 
     # Moment distribution within top 800
     moment_dist: dict[str, int] = defaultdict(int)
@@ -246,6 +420,7 @@ def step4_output(all_records: list, eligible: list,
         f" Total records              : {len(all_records):>6}",
         f" Eligible (surviving)       : {len(eligible):>6}",
         f" Ineligible (rejected)      : {len(all_records) - len(eligible):>6}",
+        f" Selection mode             : {'MMR (CLIP diversity)' if mmr_used else 'greedy (score-only)'}",
         "-" * w,
         " TOP 800 SELECTION",
         f" Target                     : {config.TOP_N_ALBUM:>6}",
@@ -277,9 +452,9 @@ def step4_output(all_records: list, eligible: list,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    """Orchestrate Phase 4: load → select → diversity check → output."""
+    """Orchestrate Phase 4: load → (MMR) select → diversity check → output."""
     parser = argparse.ArgumentParser(
-        description="Phase 4 -- Moment-balanced top-800 selection."
+        description="Phase 4 -- Moment-balanced top-800 selection (MMR when CLIP available)."
     )
     parser.add_argument(
         "--input",
@@ -291,17 +466,29 @@ def main():
         default=config.PHASE4_OUTPUT,
         help="Selected JSON to write (default: %(default)s)",
     )
+    parser.add_argument(
+        "--no-mmr",
+        action="store_true",
+        dest="no_mmr",
+        help="Disable MMR and use greedy score-ordered selection even if CLIP embeddings exist",
+    )
     args = parser.parse_args()
 
     logger = setup_logging("phase4_select")
     start  = time.time()
     logger.info(
-        "=== Phase 4 started  input=%s  output=%s ===",
-        args.input, args.output,
+        "=== Phase 4 started  input=%s  output=%s  no_mmr=%s ===",
+        args.input, args.output, args.no_mmr,
     )
 
     all_records, eligible = step1_load_validate(args.input, logger)
-    eligible = step2_moment_balanced_selection(eligible, logger)
+
+    # Load CLIP embeddings for MMR selection (optional)
+    embeddings = None
+    if not args.no_mmr:
+        embeddings = _load_clip_embeddings(config.PHASE4_CLIP_EMBEDDINGS, eligible, logger)
+
+    eligible = step2_moment_balanced_selection(eligible, logger, embeddings=embeddings)
     step3_diversity_check(eligible, logger)
     step4_output(all_records, eligible, args.output, logger)
 
