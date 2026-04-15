@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import glob
 import os
 import pickle
@@ -54,6 +55,7 @@ _NULL_ENRICHMENT = {
     "max_smile_score":  None,
     "has_closed_eyes":  False,
     "confusion_warning": False,
+    "face_bboxes":       [],
     "clip_event_tags":   [],
 }
 
@@ -416,12 +418,39 @@ def enrich_single_photo(record: dict, enrollments: dict, logger,
         aspect_ratio = pil_img.width / max(pil_img.height, 1)
 
         # ── Step 3 — Face detection + person matching ─────────────────────────
-        repr_results = DeepFace.represent(
-            img_path          = img_array,
-            model_name        = "Facenet",
-            enforce_detection = False,
-            detector_backend  = "retinaface",
-        )
+        # Wrap with a 60s wall-clock timeout — RetinaFace can hang on
+        # pathological images the same way LLaVA can hang on slow GPU calls.
+        def _do_represent():
+            return DeepFace.represent(
+                img_path          = img_array,
+                model_name        = "Facenet",
+                enforce_detection = False,
+                detector_backend  = "retinaface",
+            )
+
+        _ex  = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        _fut = _ex.submit(_do_represent)
+        try:
+            repr_results = _fut.result(timeout=60)
+        except concurrent.futures.TimeoutError:
+            _ex.shutdown(wait=False)
+            raise RuntimeError(
+                f"DeepFace timeout (60s) for {os.path.basename(record['path'])}"
+            )
+        _ex.shutdown(wait=False)
+
+        # Collect face bounding boxes for phase 3 composition scoring.
+        # DeepFace.represent() returns facial_area: {x, y, w, h} per face.
+        face_bboxes = []
+        for _fr in repr_results:
+            _fa = _fr.get("facial_area") or {}
+            if _fa:
+                face_bboxes.append({
+                    "x": int(_fa.get("x", 0)),
+                    "y": int(_fa.get("y", 0)),
+                    "w": int(_fa.get("w", 0)),
+                    "h": int(_fa.get("h", 0)),
+                })
 
         faces_detected   = len(repr_results)
         all_matched_names = []
@@ -526,6 +555,7 @@ def enrich_single_photo(record: dict, enrollments: dict, logger,
             "max_smile_score":   max_smile_score,
             "has_closed_eyes":   has_closed_eyes,
             "confusion_warning": confusion_warning,
+            "face_bboxes":       face_bboxes,
         })
 
     except Exception as exc:

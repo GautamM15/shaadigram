@@ -96,8 +96,10 @@ def save_json(path: str, data: dict | list) -> bool:
     logger = logging.getLogger(__name__)
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
         return True
     except Exception as exc:
         logger.error("Failed to save JSON to %s — %s", path, exc)

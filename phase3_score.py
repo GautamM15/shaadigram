@@ -15,6 +15,7 @@ Usage:
 import argparse
 import base64
 import concurrent.futures
+import io
 import json
 import os
 import statistics
@@ -272,6 +273,10 @@ def _load_musiq_model(logger) -> tuple:
 def score_musiq_single(path: str, musiq_metric) -> float | None:
     """Score one image with MUSIQ via pyiqa.
 
+    Pre-resizes to max 800px before scoring to avoid CUDA OOM on 42MP wedding
+    photos.  pyiqa metrics accept PIL Images directly (not just file paths),
+    so we load, thumbnail, and pass the PIL Image.
+
     Args:
         path:         Image file path.
         musiq_metric: pyiqa metric object returned by _load_musiq_model().
@@ -282,7 +287,10 @@ def score_musiq_single(path: str, musiq_metric) -> float | None:
         (rather than dragging the blend down with a 0.5 neutral guess).
     """
     try:
-        raw = musiq_metric(path)   # returns a tensor on 0-100 scale
+        img = Image.open(path).convert("RGB")
+        if max(img.size) > 800:
+            img.thumbnail((800, 800), Image.LANCZOS)
+        raw = musiq_metric(img)    # pyiqa accepts PIL Image; returns tensor on 0-100 scale
         return float(max(0.0, min(1.0, float(raw) / 100.0)))
     except Exception:
         return None
@@ -431,6 +439,10 @@ def score_laion_single(path: str, clip_model, clip_processor,
             return float(max(0.0, min(1.0, float(raw.item()) / 10.0)))
 
         # ── manual mode: CLIP ViT-B/32 + Linear(512, 1) ──────────────────────
+        # Pre-resize: open-clip resizes to 224 internally, but loading a
+        # 42MP wedding photo into the processor first causes CUDA OOM.
+        if max(img.size) > 800:
+            img.thumbnail((800, 800), Image.LANCZOS)
         inputs = clip_processor(images=[img], return_tensors="pt")
         pv     = inputs["pixel_values"].to(device)
         with _torch.no_grad():
@@ -609,7 +621,7 @@ def step1_nima(records: list, logger, model, nima_method: str,
 
     # ── Sub-pass C: blend → aesthetic_score ───────────────────────────────────
     logger.info("Step 1C -- blending aesthetic scores")
-    print("\nStep 1C: blending BRISQUE + LAION + MUSIQ → aesthetic_score")
+    print("\nStep 1C: blending BRISQUE + LAION + MUSIQ -> aesthetic_score")
     for record in surviving:
         record["aesthetic_score"] = round(
             blend_aesthetic_scores(
@@ -654,9 +666,15 @@ def _call_llava(image_path: str, logger) -> tuple:
     """
     filename = os.path.basename(image_path)
 
+    # Resize to max 1024px before encoding — LLaVA downsamples to 336 internally
+    # anyway, and sending a 20MB JPEG as base64 (~27MB) is ~100x more than needed.
     try:
-        with open(image_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        _lv_img = Image.open(image_path).convert("RGB")
+        if max(_lv_img.size) > 1024:
+            _lv_img.thumbnail((1024, 1024), Image.LANCZOS)
+        _lv_buf = io.BytesIO()
+        _lv_img.save(_lv_buf, format="JPEG", quality=85)
+        img_b64 = base64.b64encode(_lv_buf.getvalue()).decode("utf-8")
     except Exception as exc:
         logger.warning("LLaVA: could not read %s: %s", filename, exc)
         return 0.5, 0.5, True
@@ -964,36 +982,13 @@ def step_composition(records: list, logger) -> list:
 
     for record in tqdm(todo, desc="Composition", unit="photo"):
         try:
-            pil_img  = Image.open(record["path"])
-            img_w, img_h = pil_img.size
+            with Image.open(record["path"]) as pil_img:
+                img_w, img_h = pil_img.size
 
-            # Phase 2 stores face regions in repr_results; we stored faces_detected count
-            # but not bboxes in the current schema.  We reconstruct from DeepFace quickly
-            # at a reduced size to get bboxes cheaply.
-            face_bboxes = []
-            if record.get("faces_detected", 0) > 0 and _BRISQUE_AVAILABLE:
-                try:
-                    img_bgr  = cv2.imread(record["path"])
-                    if img_bgr is not None:
-                        scale    = min(1.0, 600 / max(img_bgr.shape[1], 1))
-                        small    = cv2.resize(img_bgr, None, fx=scale, fy=scale)
-                        # Use OpenCV Haar for cheap bbox detection (not identity)
-                        face_cascade = cv2.CascadeClassifier(
-                            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                        )
-                        gray     = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                        detects  = face_cascade.detectMultiScale(
-                            gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
-                        )
-                        for (fx, fy, fw, fh) in detects:
-                            face_bboxes.append({
-                                "x": int(fx / scale),
-                                "y": int(fy / scale),
-                                "w": int(fw / scale),
-                                "h": int(fh / scale),
-                            })
-                except Exception:
-                    pass   # fall back to empty bboxes → neutral scores
+            # Use bboxes stored by phase 2 (DeepFace.represent() → facial_area).
+            # Falls back to empty list for records enriched before this fix,
+            # giving neutral scores (0.5) instead of incorrect Haar detections.
+            face_bboxes = record.get("face_bboxes") or []
 
             record["rot_score"]          = _compute_rot_score(face_bboxes, img_w, img_h)
             record["prominence_score"]   = _compute_prominence(face_bboxes, img_w, img_h)
@@ -1110,9 +1105,6 @@ def step_burst_compare(records: list, logger, skip_llava: bool) -> list:
     logger.info("Step 2c -- LLaVA burst comparison  groups=%d", len(burst_groups))
     print(f"\nStep 2c: LLaVA burst comparison  groups={len(burst_groups)}")
 
-    import base64
-    import io
-
     adjusted = 0
     errors   = 0
 
@@ -1196,6 +1188,26 @@ def step_burst_compare(records: list, logger, skip_llava: bool) -> list:
 
 # ── Step 3 — Combined scoring ─────────────────────────────────────────────────
 
+def _coalesce(*vals: float | None, default: float = 0.0) -> float:
+    """Return the first non-None value, or default.
+
+    Replaces ``record.get("field") or 0.0`` patterns which treat 0.0 as
+    missing (Python falsy), silently falling back to the wrong value when a
+    photo legitimately scores zero.
+
+    Args:
+        *vals:   Values to test in order.
+        default: Returned if all vals are None.
+
+    Returns:
+        First non-None value cast to float, or default.
+    """
+    for v in vals:
+        if v is not None:
+            return float(v)
+    return default
+
+
 def compute_final_score(record: dict) -> dict:
     """Compute base and final weighted scores for one record.
 
@@ -1221,15 +1233,15 @@ def compute_final_score(record: dict) -> dict:
     Returns:
         Dict with base_score, final_score, score_components.
     """
-    # Aesthetic: prefer aesthetic_score (blend), fall back to laion_score → nima_score for old records
-    aesthetic    = (
-        record.get("aesthetic_score")
-        or record.get("laion_score")
-        or record.get("nima_score")
-        or 0.0
+    # Aesthetic: prefer aesthetic_score (blend), fall back to laion_score → nima_score for old records.
+    # Use _coalesce (not `or`) so a legitimate 0.0 score is not treated as missing.
+    aesthetic    = _coalesce(
+        record.get("aesthetic_score"),
+        record.get("laion_score"),
+        record.get("nima_score"),
     )
-    emotion      = record.get("emotion_score")      or 0.0
-    memorability = record.get("memorability_score") or 0.0
+    emotion      = _coalesce(record.get("emotion_score"))
+    memorability = _coalesce(record.get("memorability_score"))
     rot          = record.get("rot_score")
     prominence   = record.get("prominence_score")
     distraction  = record.get("distraction_penalty") or 1.0

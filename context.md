@@ -1,7 +1,12 @@
 ## Last Updated
-2026-04-15 (MUSIQ blend upgrade)
+2026-04-15 (eng-review fixes — 9 issues patched)
 
 ## Current Status
+Eng-review fixes — COMPLETE (2026-04-15)
+  utils.py: atomic JSON writes (tmp+os.replace) — all checkpoints now crash-safe
+  phase1_filter.py: error logging in process_single_photo; O(N²) phash dedup sharded by folder (~900x reduction at 21k)
+  phase2_enrich.py: DeepFace.represent() wrapped with 60s timeout; face_bboxes stored per record for phase3 composition
+  phase3_score.py: manual LAION mode 800px resize (CUDA OOM fix); step_composition reads stored bboxes (no Haar re-detect); _coalesce() fixes `or` bug on zero scores; LLaVA payload resized to 1024px (100x smaller)
 MUSIQ aesthetic blend upgrade — COMPLETE (2026-04-15)
   phase3_score.py: +MUSIQ scoring (pyiqa, 0-100→0-1), +blend_aesthetic_scores() (BRISQUE×0.20+LAION×0.40+MUSIQ×0.40), +--reweight flag, +--skip-musiq flag, aesthetic_score field replaces laion_score in formula
   config.py: +BRISQUE_BLEND_WEIGHT=0.20, +LAION_BLEND_WEIGHT=0.40, +MUSIQ_BLEND_WEIGHT=0.40

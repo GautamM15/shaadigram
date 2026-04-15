@@ -18,6 +18,7 @@ Usage:
 import argparse
 import concurrent.futures
 import hashlib
+import logging
 import json
 import os
 import time
@@ -247,8 +248,10 @@ def process_single_photo(path: str) -> dict:
             "soft_blur_surviving" if tier == "soft_blur" else "surviving"
         )
 
-    except Exception:
-        pass  # record["status"] remains "error" from initialisation
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Error processing %s: %s", os.path.basename(path), exc
+        )
 
     return record
 
@@ -303,10 +306,19 @@ def cluster_duplicates(records: list) -> list:
     hashes = [imagehash.hex_to_hash(records[i]["phash"]) for i in candidates]
     uf = UnionFind(n)
 
-    for a in range(n):
-        for b in range(a + 1, n):
-            if hashes[a] - hashes[b] <= config.DUPLICATE_HASH_THRESHOLD:
-                uf.union(a, b)
+    # Shard by parent folder before the O(N²) comparison.
+    # Cross-folder filename duplicates are already caught by --scan-report Pass A.
+    # Near-duplicates (burst shots, slight reframes) are always in the same subfolder.
+    # At 21k photos this reduces ~220M comparisons to ~245k per moment subfolder.
+    folder_buckets: dict = defaultdict(list)
+    for pos, rec_idx in enumerate(candidates):
+        folder_buckets[os.path.dirname(records[rec_idx]["path"])].append(pos)
+
+    for bucket_positions in folder_buckets.values():
+        for i, pos_a in enumerate(bucket_positions):
+            for pos_b in bucket_positions[i + 1:]:
+                if hashes[pos_a] - hashes[pos_b] <= config.DUPLICATE_HASH_THRESHOLD:
+                    uf.union(pos_a, pos_b)
 
     # Group candidate positions by their Union-Find root
     groups = defaultdict(list)
