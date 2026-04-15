@@ -1,7 +1,11 @@
 ## Last Updated
-2026-04-14
+2026-04-15 (MUSIQ blend upgrade)
 
 ## Current Status
+MUSIQ aesthetic blend upgrade — COMPLETE (2026-04-15)
+  phase3_score.py: +MUSIQ scoring (pyiqa, 0-100→0-1), +blend_aesthetic_scores() (BRISQUE×0.20+LAION×0.40+MUSIQ×0.40), +--reweight flag, +--skip-musiq flag, aesthetic_score field replaces laion_score in formula
+  config.py: +BRISQUE_BLEND_WEIGHT=0.20, +LAION_BLEND_WEIGHT=0.40, +MUSIQ_BLEND_WEIGHT=0.40
+  download_models.py: +verify_musiq() step 4
 Phase 2/3/4 upgrades — COMPLETE (CLIP, LAION, composition scoring, MMR — syntax-verified)
   phase2_enrich.py: +step6_clip_embeddings() (ViT-B/32, batch=32, clip_embeddings.npz, clip_event_tags, --skip-clip)
   phase3_score.py: +LAION aesthetic (ViT-L/14+MLP aesthetic_model.pth, fallback BRISQUE), +step_composition() (rot_score/prominence_score/distraction_penalty), +step_burst_compare() (LLaVA grid, burst_rank, emotion adjustment), updated formula LAION×0.25+emotion×0.35+memorab×0.15+rot×0.10+prominence×0.15=1.00, --skip-composition flag
@@ -24,8 +28,8 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 |-------|------|--------|--------|
 | 1 | phase1_filter.py | ✅ Complete | surviving_photos_candid.json |
 | 2 | phase2_enrich.py | ✅ Complete, full run done | enriched_photos_candid.json |
-| 3 | phase3_score.py | ✅ Complete, full run done | scored_photos_candid.json |
-| 4 | phase4_select.py | ✅ Complete | selected_photos_candid.json |
+| 3 | phase3_score.py | ✅ Complete, re-run done (LAION) | scored_photos_candid.json |
+| 4 | phase4_select.py | ⏳ Running | selected_photos_candid.json |
 | 5 | phase5_review.py | ✅ Complete | review_progress.json + output/album_approved/ |
 | 6 | phase6_export.py | ⏳ Not started | - |
 | - | enroll_face.py | ✅ Complete | {name}_face.pkl |
@@ -43,19 +47,22 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
   - Moments: 8 identified, 1,197 photos with EXIF timestamps; 279 rejected records have none
   - Errors: 0
 - Enrolled persons: none (both gautam_face.pkl and siddharth_face.pkl deleted — enrollments were contaminated)
-- Phase 3 full run (1,476 photos): 5 LLaVA fallbacks, 14,505s (~4h 1m), ~9.0s/photo
-  - BRISQUE: 1,476/1,476 | NIMA: 0 (skip-nima flag used) | LLaVA fallbacks: 5
-  - Score range: 0.2437–0.8250 | Mean: 0.6464 | Median: 0.6750
-  - Candid bonus applied: 64 | Closed-eyes penalty: 0 | Soft-blur penalty: 64
-  - Top photo: TMS00200.jpg at 0.8250
-  - Output: scored_photos_candid.json (1,755 records, 1,476 scored)
-- Photos scored: 1,476
-- Phase 4 selection (0.08s):
-  - Top 800 selected: 800/800 (rank 1: TMS00200.jpg score=0.825, rank 800: TMS02443.jpg score=0.656)
+- Phase 3 full run (1,477 photos): 74 LLaVA fallbacks, 16,500s (~4h 35m), ~11.2s/photo
+  - LAION: 1,477/1,477 | BRISQUE fallbacks: 0 | LLaVA fallbacks: 74
+  - Score range: 0.2220–0.7821 | Mean: 0.5897 | Median: 0.6114
+  - Candid bonus applied: 64 | Closed-eyes penalty: 0 | Soft-blur penalty: 64 | Distraction penalty: 0
+  - Top photo: FMP00678.jpg at 0.7821
+  - Output: scored_photos_candid.json (1,521 records, 1,477 scored, 44 rejected)
+- Photos scored: 1,477
+- Phase 4 selection (11s):
+  - Mode: MMR (CLIP diversity, lambda=0.7, 100% embedding coverage)
+  - Top 800 selected: 800/800 (rank 1: FMP00678.jpg score=0.7821, rank 800: TMS09896.jpg score=0.6077)
   - Moment balancing: all photos moment_label=unknown (no EXIF in CANDID set — no cap applied)
-  - Shot type distribution in top 800: solo_portrait 314 (39.2%), group 252 (31.5%), couple 234 (29.2%)
+  - Shot type distribution in top 800: solo_portrait 274 (34.2%), group 273 (34.1%), couple 253 (31.6%)
   - No diversity warnings (no type > 60%)
-  - Output: selected_photos_candid.json (1,755 records, in_top800 + selection_rank on every record)
+  - Score distribution: >=0.80: 0 | 0.70-0.79: 109 (13.6%) | 0.60-0.69: 642 (80.2%) | 0.50-0.59: 49 (6.1%)
+  - Mean: 0.6577 | Median: 0.6556
+  - Output: selected_photos_candid.json (1,521 records, in_top800 + selection_rank on every record)
   - Gautam identification removed from phase 4 — done manually in phase 5 review UI
 - Final album selection: 800 (top 800 selected)
 
@@ -82,6 +89,15 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 - phase3_score.py: LAION aesthetic replaces BRISQUE/NIMA in step1 (priority: LAION→NIMA→BRISQUE); step_composition() added (step 2b: rot/prominence/distraction); step_burst_compare() added (step 2c: LLaVA grid ranking, emotion_score adjustment, burst_rank field); compute_final_score() updated to new formula; --skip-composition flag added; aesthetic_model.pth must be downloaded manually
 - phase4_select.py: _load_clip_embeddings() + _mmr_select() added; step2_moment_balanced_selection() extended with embeddings= param; --no-mmr flag added; mmr_score field in output
 - config.py: EMOTION_WEIGHT changed from 0.40 to 0.35 (new formula requires 0.35); LIGHTING_WEIGHT commented out (replaced by ROT_WEIGHT + PROMINENCE_WEIGHT)
+
+## MUSIQ Blend Upgrade (2026-04-15)
+- phase3_score.py: step1_nima() restructured into 3 sub-passes: A=LAION+BRISQUE, B=MUSIQ, C=blend
+- New fields per record: brisque_score, musiq_score, aesthetic_score (brisque×0.20 + laion×0.40 + musiq×0.40)
+- compute_final_score() now uses aesthetic_score (falls back to laion_score → nima_score for old JSONs)
+- --reweight flag: re-blends + re-scores in <10s without re-running models; edit blend weights in config.py then run
+- --skip-musiq flag: aesthetic blend uses BRISQUE+LAION only (weights redistributed)
+- download_models.py: verify_musiq() added as step 4
+- pyiqa must be installed: pip install pyiqa
 
 ## Known Issues / Flags
 - Phase 3 LAION: FIXED (2026-04-15). Uses aesthetic-predictor pip package (predict_aesthetic, open-clip-torch, vit_b_32 nn.Linear(512,1)). No weights file needed. Architecture corrected from wrong 5-layer MLP to single linear layer.

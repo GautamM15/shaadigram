@@ -3,7 +3,7 @@
 ## Current Status
 - Last completed: Phase 2/3/4 upgrades ✅ (CLIP, LAION, composition, MMR — 2026-04-14)
 - phase2_enrich.py ✅ — +step6_clip_embeddings() ViT-B/32, batch=32, clip_embeddings.npz, clip_event_tags, --skip-clip
-- phase3_score.py ✅ — +LAION aesthetic (ViT-L/14+MLP, fallback BRISQUE), +composition (rot/prominence/distraction), +burst compare (LLaVA grid, burst_rank), updated formula, --skip-composition flag
+- phase3_score.py ✅ — +MUSIQ scoring (pyiqa), +aesthetic blend (BRISQUE×0.20+LAION×0.40+MUSIQ×0.40→aesthetic_score), +--reweight flag (re-blend in <10s), +--skip-musiq flag; +LAION aesthetic, +composition, +burst compare
 - phase4_select.py ✅ — +MMR selection (lambda=0.7, CLIP embeddings, moment cap), --no-mmr flag, mmr_score field
 - config.py ✅ — EMOTION_WEIGHT 0.40→0.35, +LAION_WEIGHT/ROT_WEIGHT/PROMINENCE_WEIGHT/DISTRACTION_PENALTY/BURST_RANK_BONUS/PENALTY/CLIP_*/MMR_LAMBDA
 - phase1_filter.py ✅ — --scan-report (Pass A filename dedup + Pass B phash dedup + step1_ingest pre-filter)

@@ -242,6 +242,64 @@ def verify_clip_l14() -> bool:
         return False
 
 
+# ── Step 4 — Verify MUSIQ (phase 3 aesthetic blend) ──────────────────────────
+
+def verify_musiq() -> bool:
+    """Load pyiqa MUSIQ metric and run a single forward pass on a temp image.
+
+    Downloads model weights on first run (~200 MB to ~/.cache/pyiqa/).
+
+    Returns:
+        True on success, False on failure.
+    """
+    print("\n" + "=" * 56)
+    print("  Step 4 — MUSIQ  (phase 3 aesthetic blend)")
+    print("=" * 56)
+
+    try:
+        import pyiqa
+    except ImportError:
+        print("  SKIP: pyiqa not installed — run: pip install pyiqa")
+        print("  Without MUSIQ, aesthetic blend uses BRISQUE(0.20)+LAION(0.40) only.")
+        return False
+
+    try:
+        import torch
+        import numpy as np
+        import tempfile
+        from PIL import Image
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"  Device: {device}")
+        print("  Loading MUSIQ metric (downloads ~200 MB to ~/.cache/pyiqa/ on first run) ...")
+
+        metric = pyiqa.create_metric("musiq", device=device)
+
+        # Write a small temp JPEG to score (pyiqa takes a file path)
+        dummy = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+        )
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+            dummy.save(tmp_path, "JPEG")
+
+        try:
+            raw = metric(tmp_path)
+            score = float(raw) / 100.0
+            print(f"  Test score: {score:.4f} (raw={float(raw):.2f}/100)")
+            print("  MUSIQ: OK")
+            return True
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    except Exception as exc:
+        print(f"  ERROR: {exc}")
+        return False
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -250,8 +308,9 @@ def main() -> None:
     print("=" * 56)
 
     results = {}
-    results["laion"]       = download_laion()
-    results["clip_b32"]    = verify_clip_b32()
+    results["laion"]    = download_laion()
+    results["clip_b32"] = verify_clip_b32()
+    results["musiq"]    = verify_musiq()
 
     # ── Final report ──────────────────────────────────────────────────────────
     w = 56
@@ -261,6 +320,7 @@ def main() -> None:
     labels = {
         "laion":    "LAION aesthetic_model.pth (vit_b_32)",
         "clip_b32": "CLIP ViT-B/32 (phase 2 + phase 3)",
+        "musiq":    "MUSIQ (phase 3 aesthetic blend)",
     }
     all_ok = True
     for key, label in labels.items():
@@ -276,6 +336,7 @@ def main() -> None:
     else:
         print("  Some models failed — see details above.")
         print("  Pipeline will fall back to BRISQUE if LAION is missing.")
+        print("  MUSIQ failure: aesthetic blend uses BRISQUE+LAION only (--skip-musiq).")
         print("  Phase 4 MMR requires clip_embeddings.npz from phase 2.")
     print()
     sys.exit(0 if all_ok else 1)

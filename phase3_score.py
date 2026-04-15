@@ -33,6 +33,11 @@ from utils import load_json, save_json, setup_logging
 
 try:
     import tensorflow as tf
+    # Enable memory growth so TF does not pre-allocate all VRAM.
+    # Without this, TF claims all 4 GB at startup and CUDA OOM-crashes
+    # any subsequent library (open-clip, torch) that tries to allocate GPU memory.
+    for _gpu_dev in tf.config.list_physical_devices('GPU'):
+        tf.config.experimental.set_memory_growth(_gpu_dev, True)
     from tensorflow.keras.applications import MobileNet
     from tensorflow.keras.layers import Dense
     from tensorflow.keras.models import Model
@@ -79,6 +84,12 @@ try:
 except ImportError:
     _CLIP_LAION_AVAILABLE = False
 
+try:
+    import pyiqa as _pyiqa
+    _MUSIQ_AVAILABLE = True
+except ImportError:
+    _MUSIQ_AVAILABLE = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Statuses that receive full scoring (matches phase 1 / 2 convention)
@@ -118,8 +129,11 @@ _LLAVA_RETRY_PROMPT = (
 
 # Null scoring block applied to rejected / non-surviving records
 _NULL_SCORE = {
+    "brisque_score":       None,
     "laion_score":         None,
     "laion_method":        None,
+    "musiq_score":         None,
+    "aesthetic_score":     None,
     "nima_score":          None,   # kept for backward compat
     "nima_method":         None,   # kept for backward compat
     "rot_score":           None,
@@ -223,6 +237,86 @@ def score_brisque(image_path: str) -> float:
         return float(max(0.0, min(1.0, 1.0 - raw / 100.0)))
     except Exception:
         return 0.5
+
+
+# ── MUSIQ aesthetic model ─────────────────────────────────────────────────────
+
+def _load_musiq_model(logger) -> tuple:
+    """Load the MUSIQ image quality metric via pyiqa.
+
+    Downloads model weights on first run (~200 MB to ~/.cache/pyiqa/).
+    Falls back gracefully if pyiqa is not installed or loading fails.
+
+    Args:
+        logger: Logger instance.
+
+    Returns:
+        Tuple (metric, device) on success, or (None, None) on failure.
+    """
+    if not _MUSIQ_AVAILABLE:
+        logger.warning("MUSIQ: pyiqa not installed -- pip install pyiqa")
+        return None, None
+
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("Loading MUSIQ model on %s ...", device)
+        metric = _pyiqa.create_metric("musiq", device=device)
+        logger.info("MUSIQ model loaded on %s", device)
+        return metric, device
+    except Exception as exc:
+        logger.warning("MUSIQ load failed (%s) -- MUSIQ component will be skipped", exc)
+        return None, None
+
+
+def score_musiq_single(path: str, musiq_metric) -> float | None:
+    """Score one image with MUSIQ via pyiqa.
+
+    Args:
+        path:         Image file path.
+        musiq_metric: pyiqa metric object returned by _load_musiq_model().
+
+    Returns:
+        Float in [0, 1] (raw 0-100 score divided by 100), or None on failure.
+        None signals that this component should be excluded from the blend
+        (rather than dragging the blend down with a 0.5 neutral guess).
+    """
+    try:
+        raw = musiq_metric(path)   # returns a tensor on 0-100 scale
+        return float(max(0.0, min(1.0, float(raw) / 100.0)))
+    except Exception:
+        return None
+
+
+def blend_aesthetic_scores(
+    brisque_score: float | None,
+    laion_score:   float | None,
+    musiq_score:   float | None,
+) -> float:
+    """Blend BRISQUE, LAION, and MUSIQ into a single aesthetic_score.
+
+    Uses config.BRISQUE_BLEND_WEIGHT / LAION_BLEND_WEIGHT / MUSIQ_BLEND_WEIGHT
+    as base weights.  If any component is None its weight is redistributed
+    proportionally among the remaining components.
+
+    Args:
+        brisque_score: BRISQUE score [0, 1] or None.
+        laion_score:   LAION aesthetic score [0, 1] or None.
+        musiq_score:   MUSIQ score [0, 1] or None.
+
+    Returns:
+        Blended float in [0, 1].  Returns 0.5 if all three are None.
+    """
+    candidates = [
+        (brisque_score, config.BRISQUE_BLEND_WEIGHT),
+        (laion_score,   config.LAION_BLEND_WEIGHT),
+        (musiq_score,   config.MUSIQ_BLEND_WEIGHT),
+    ]
+    available = [(s, w) for s, w in candidates if s is not None]
+    if not available:
+        return 0.5
+    total_w = sum(w for _, w in available)
+    return float(sum(s * w for s, w in available) / total_w)
 
 
 # ── LAION aesthetic model ─────────────────────────────────────────────────────
@@ -329,6 +423,10 @@ def score_laion_single(path: str, clip_model, clip_processor,
 
         # ── pip mode ──────────────────────────────────────────────────────────
         if clip_processor is None:
+            # Pre-resize to max 800px — open-clip resizes to 224 internally,
+            # but loading a 42MP wedding photo into RAM first causes OOM.
+            if max(img.size) > 800:
+                img.thumbnail((800, 800), Image.LANCZOS)
             raw = clip_model(img)   # predict_aesthetic returns Tensor shape (1,1), 1-10 scale
             return float(max(0.0, min(1.0, float(raw.item()) / 10.0)))
 
@@ -347,101 +445,122 @@ def score_laion_single(path: str, clip_model, clip_processor,
 
 def step1_nima(records: list, logger, model, nima_method: str,
                skip_nima: bool,
-               laion_components: tuple = None) -> list:
-    """Run aesthetic scoring (LAION → NIMA → BRISQUE fallback chain) on all surviving photos.
+               laion_components: tuple = None,
+               musiq_components: tuple = None,
+               checkpoint_path: str = None) -> list:
+    """Run aesthetic scoring — BRISQUE + LAION + MUSIQ blend — on all surviving photos.
 
-    Priority: LAION aesthetic predictor (if laion_components provided and
-    skip_nima is False) → NIMA (if model loaded) → BRISQUE (fallback).
+    Three sub-passes, each resumable independently:
 
-    Populates both laion_score/laion_method (new formula fields) and
-    nima_score/nima_method (kept for backward compatibility).
+    Sub-pass A  (LAION + BRISQUE):
+        LAION aesthetic predictor (pip package or manual weights).
+        BRISQUE always computed alongside as a cheap CPU baseline.
+        Falls back to BRISQUE-only if LAION unavailable or skip_nima set.
+        Checkpoints every 100 photos.
+
+    Sub-pass B  (MUSIQ):
+        pyiqa MUSIQ metric (loaded separately to avoid VRAM pressure).
+        Runs only if musiq_components is not None.
+        Stores musiq_score per record (None if component fails).
+        Checkpoints every 100 photos.
+
+    Sub-pass C  (blend):
+        blend_aesthetic_scores(brisque, laion, musiq) → aesthetic_score.
+        Redistributes weight of any None component among remaining ones.
+        In-memory, no I/O.
 
     Args:
         records:          All records (surviving + rejected).
         logger:           Logger instance.
         model:            Loaded NIMA Keras model, or None.
         nima_method:      "nima" or "brisque".
-        skip_nima:        If True, skip LAION+NIMA and force BRISQUE.
-        laion_components: Tuple (clip_model, clip_proc, laion_mlp, device)
-                          from _load_laion_model(), or None.
+        skip_nima:        If True, skip LAION+NIMA and use BRISQUE only.
+        laion_components: 4-tuple from _load_laion_model(), or None.
+        musiq_components: 2-tuple (metric, device) from _load_musiq_model(), or None.
+        checkpoint_path:  Path for incremental JSON checkpoints, or None.
 
     Returns:
-        Records with laion_score, laion_method, nima_score, nima_method populated.
+        Records with brisque_score, laion_score, laion_method, musiq_score,
+        aesthetic_score, nima_score, nima_method populated for surviving records.
     """
     use_laion = (
         not skip_nima
         and laion_components is not None
         and laion_components[0] is not None
     )
+    use_musiq = (
+        musiq_components is not None
+        and musiq_components[0] is not None
+    )
     effective_method = "brisque" if skip_nima else ("laion" if use_laion else nima_method)
 
     surviving = [r for r in records if r["status"] in _SURVIVING]
 
-    # Resume: skip records that already have a laion_score
-    already_done = [r for r in surviving if r.get("laion_score") is not None]
-    todo         = [r for r in surviving if r.get("laion_score") is None]
-    if already_done:
+    # ── Sub-pass A: LAION + BRISQUE ───────────────────────────────────────────
+    laion_todo = [r for r in surviving if r.get("laion_score") is None]
+    if laion_todo:
         logger.info(
-            "Step 1 RESUME: %d/%d already scored, scoring remaining %d",
-            len(already_done), len(surviving), len(todo),
+            "Step 1A -- LAION+BRISQUE scoring  method=%s  photos=%d",
+            effective_method, len(laion_todo),
         )
-        print(
-            f"\nStep 1 RESUME: {len(already_done)}/{len(surviving)} already scored, "
-            f"scoring remaining {len(todo)}"
-        )
+        print(f"\nStep 1A: LAION+BRISQUE scoring  method={effective_method}  photos={len(laion_todo)}")
     else:
-        logger.info(
-            "Step 1 -- aesthetic scoring  method=%s  photos=%d",
-            effective_method, len(surviving),
-        )
-        print(f"\nStep 1: aesthetic scoring  method={effective_method}  photos={len(surviving)}")
+        logger.info("Step 1A -- LAION+BRISQUE already done (%d records)", len(surviving))
+        print(f"\nStep 1A: already done ({len(surviving)} records)")
 
     clip_model, clip_proc, laion_mlp, laion_device = (
         laion_components if laion_components else (None, None, None, None)
     )
 
-    for record in tqdm(todo, desc="Aesthetic scoring", unit="photo"):
+    for _step1_i, record in enumerate(tqdm(laion_todo, desc="LAION+BRISQUE", unit="photo")):
+        # BRISQUE — always, CPU-only, fast
+        record["brisque_score"] = round(score_brisque(record["path"]), 6)
+
+        # LAION / NIMA / BRISQUE-only
         try:
             if skip_nima or (not use_laion and model is None):
-                score_val   = score_brisque(record["path"])
+                laion_val   = record["brisque_score"]
                 method_used = "brisque"
             elif use_laion:
-                score_val   = score_laion_single(
+                laion_val   = score_laion_single(
                     record["path"], clip_model, clip_proc, laion_mlp, laion_device
                 )
                 method_used = "laion"
             else:
-                pil_img     = Image.open(record["path"]).convert("RGB")
-                score_val   = score_nima(pil_img, model)
+                pil_img   = Image.open(record["path"]).convert("RGB")
+                laion_val = score_nima(pil_img, model)
                 method_used = "nima"
         except Exception as exc:
             logger.warning(
-                "Aesthetic scoring failed for %s: %s -- BRISQUE fallback",
+                "LAION scoring failed for %s: %s -- BRISQUE fallback",
                 os.path.basename(record["path"]), exc,
             )
-            score_val   = score_brisque(record["path"])
+            laion_val   = record["brisque_score"]
             method_used = "brisque"
 
-        record["laion_score"]  = round(float(score_val), 6)
+        record["laion_score"]  = round(float(laion_val), 6)
         record["laion_method"] = method_used
-        # Backward compat: keep nima_score mirroring laion_score
-        record["nima_score"]   = record["laion_score"]
+        record["nima_score"]   = record["laion_score"]   # backward compat
         record["nima_method"]  = method_used
 
-    # Also mirror already-done records that have laion_score but not nima_score
-    for record in already_done:
-        if record.get("nima_score") is None:
-            record["nima_score"]  = record.get("laion_score")
-            record["nima_method"] = record.get("laion_method")
+        if use_laion and (_step1_i + 1) % 100 == 0:
+            try:
+                import torch as _t
+                _t.cuda.empty_cache()
+            except Exception:
+                pass
+            if checkpoint_path:
+                save_json(records, checkpoint_path)
+                logger.info("LAION checkpoint: %d photos scored → %s",
+                            _step1_i + 1, checkpoint_path)
 
-    for record in records:
-        if record["status"] not in _SURVIVING:
-            record["laion_score"]  = None
-            record["laion_method"] = None
-            record["nima_score"]   = None
-            record["nima_method"]  = None
+    # Mirror already-done records that lack nima_score
+    for record in [r for r in surviving if r.get("laion_score") is not None
+                   and r.get("nima_score") is None]:
+        record["nima_score"]  = record["laion_score"]
+        record["nima_method"] = record.get("laion_method")
 
-    # Free LAION GPU memory now — LLaVA needs the VRAM next
+    # Free LAION GPU memory — MUSIQ needs the VRAM next
     if use_laion and _TORCH_AVAILABLE:
         import gc
         del clip_model, clip_proc, laion_mlp
@@ -451,6 +570,66 @@ def step1_nima(records: list, logger, model, nima_method: str,
             pass
         gc.collect()
         logger.info("LAION CLIP model freed from GPU memory")
+
+    # ── Sub-pass B: MUSIQ ─────────────────────────────────────────────────────
+    if use_musiq:
+        musiq_metric, _musiq_dev = musiq_components
+        musiq_todo = [r for r in surviving if r.get("musiq_score") is None]
+        if musiq_todo:
+            logger.info("Step 1B -- MUSIQ scoring  photos=%d", len(musiq_todo))
+            print(f"\nStep 1B: MUSIQ scoring  photos={len(musiq_todo)}")
+        else:
+            logger.info("Step 1B -- MUSIQ already done (%d records)", len(surviving))
+            print(f"\nStep 1B: MUSIQ already done ({len(surviving)} records)")
+
+        for _step1b_i, record in enumerate(tqdm(musiq_todo, desc="MUSIQ", unit="photo")):
+            record["musiq_score"] = score_musiq_single(record["path"], musiq_metric)
+            if record["musiq_score"] is not None:
+                record["musiq_score"] = round(record["musiq_score"], 6)
+
+            if (_step1b_i + 1) % 100 == 0:
+                if checkpoint_path:
+                    save_json(records, checkpoint_path)
+                    logger.info("MUSIQ checkpoint: %d photos scored → %s",
+                                _step1b_i + 1, checkpoint_path)
+
+        # Free MUSIQ GPU memory
+        if _TORCH_AVAILABLE:
+            import gc
+            del musiq_metric
+            try:
+                _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
+            logger.info("MUSIQ model freed from GPU memory")
+    else:
+        logger.info("Step 1B -- MUSIQ skipped (not loaded)")
+        print("\nStep 1B: MUSIQ skipped")
+
+    # ── Sub-pass C: blend → aesthetic_score ───────────────────────────────────
+    logger.info("Step 1C -- blending aesthetic scores")
+    print("\nStep 1C: blending BRISQUE + LAION + MUSIQ → aesthetic_score")
+    for record in surviving:
+        record["aesthetic_score"] = round(
+            blend_aesthetic_scores(
+                record.get("brisque_score"),
+                record.get("laion_score"),
+                record.get("musiq_score"),
+            ),
+            6,
+        )
+
+    # Null-fill rejected records
+    for record in records:
+        if record["status"] not in _SURVIVING:
+            record.setdefault("brisque_score",   None)
+            record.setdefault("laion_score",     None)
+            record.setdefault("laion_method",    None)
+            record.setdefault("musiq_score",     None)
+            record.setdefault("aesthetic_score", None)
+            record.setdefault("nima_score",      None)
+            record.setdefault("nima_method",     None)
 
     logger.info("Step 1 complete")
     return records
@@ -1042,8 +1221,13 @@ def compute_final_score(record: dict) -> dict:
     Returns:
         Dict with base_score, final_score, score_components.
     """
-    # Aesthetic: prefer laion_score, fall back to nima_score for old records
-    laion        = record.get("laion_score") or record.get("nima_score") or 0.0
+    # Aesthetic: prefer aesthetic_score (blend), fall back to laion_score → nima_score for old records
+    aesthetic    = (
+        record.get("aesthetic_score")
+        or record.get("laion_score")
+        or record.get("nima_score")
+        or 0.0
+    )
     emotion      = record.get("emotion_score")      or 0.0
     memorability = record.get("memorability_score") or 0.0
     rot          = record.get("rot_score")
@@ -1055,7 +1239,7 @@ def compute_final_score(record: dict) -> dict:
     prominence = 0.5 if prominence is None else float(prominence)
 
     base_score = (
-        laion        * config.LAION_WEIGHT        +
+        aesthetic    * config.LAION_WEIGHT        +
         emotion      * config.EMOTION_WEIGHT      +
         memorability * config.MEMORABILITY_WEIGHT +
         rot          * config.ROT_WEIGHT          +
@@ -1081,7 +1265,7 @@ def compute_final_score(record: dict) -> dict:
         "base_score":  round(base_score,  6),
         "final_score": round(final_score, 6),
         "score_components": {
-            "laion":               round(laion        * config.LAION_WEIGHT,        6),
+            "aesthetic":           round(aesthetic    * config.LAION_WEIGHT,        6),
             "emotion":             round(emotion      * config.EMOTION_WEIGHT,      6),
             "memorability":        round(memorability * config.MEMORABILITY_WEIGHT, 6),
             "rot":                 round(rot          * config.ROT_WEIGHT,          6),
@@ -1140,6 +1324,7 @@ def step4_output(records: list, logger, output_path: str) -> None:
 
     laion_ct    = sum(1 for r in surviving if r.get("laion_method") == "laion")
     brisque_ct  = sum(1 for r in surviving if r.get("laion_method") == "brisque")
+    musiq_ct    = sum(1 for r in surviving if r.get("musiq_score") is not None)
     fallback_ct = sum(1 for r in surviving if r.get("llava_fallback"))
     burst_ct    = sum(1 for r in surviving if r.get("burst_rank") is not None)
     distract_ct = sum(
@@ -1184,8 +1369,9 @@ def step4_output(records: list, logger, output_path: str) -> None:
         f" Scored (surviving)         : {n_scored:>6}",
         f" Skipped (rejected)         : {total - n_scored:>6}",
         "-" * w,
-        f" LAION aesthetic            : {laion_ct:>6}",
-        f" BRISQUE (fallback)         : {brisque_ct:>6}",
+        f" LAION scored               : {laion_ct:>6}",
+        f" BRISQUE (LAION fallback)   : {brisque_ct:>6}",
+        f" MUSIQ scored               : {musiq_ct:>6}",
         f" LLaVA fallbacks            : {fallback_ct:>6}",
         f" Burst-ranked photos        : {burst_ct:>6}",
         "-" * w,
@@ -1201,7 +1387,8 @@ def step4_output(records: list, logger, output_path: str) -> None:
         f"   soft-blur penalty (-5%)  : {soft_blur_ct:>6}",
         f"   distraction penalty (-10%): {distract_ct:>5}",
         "-" * w,
-        " Formula: LAION(0.25)+emotion(0.35)+memorab(0.15)",
+        " Aesthetic blend: BRISQUE×0.20 + LAION×0.40 + MUSIQ×0.40",
+        " Formula: aesthetic(0.25)+emotion(0.35)+memorab(0.15)",
         "          +rot(0.10)+prominence(0.15) = 1.00",
         "-" * w,
         " Top 10 photos by final_score:",
@@ -1260,11 +1447,27 @@ def main():
         help="Skip composition scoring step (rot_score, prominence_score, distraction_penalty)",
     )
     parser.add_argument(
+        "--skip-musiq",
+        action="store_true",
+        dest="skip_musiq",
+        help="Skip MUSIQ scoring (aesthetic blend will use BRISQUE + LAION only)",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
             "Resume a previous run: load records from output file (if it exists) "
             "instead of the input file, skipping already-scored photos"
+        ),
+    )
+    parser.add_argument(
+        "--reweight",
+        action="store_true",
+        help=(
+            "Re-blend and re-score only — no model inference. "
+            "Loads existing output JSON, re-computes aesthetic_score from stored "
+            "brisque_score/laion_score/musiq_score using current config blend weights, "
+            "then re-runs compute_final_score(). Completes in under 60 seconds."
         ),
     )
     args = parser.parse_args()
@@ -1276,11 +1479,47 @@ def main():
 
     logger = setup_logging("phase3_score")
     start  = time.time()
+
+    # ── --reweight: fast re-blend + re-score, no model inference ─────────────
+    if args.reweight:
+        logger.info(
+            "=== Phase 3 REWEIGHT  input=%s  output=%s ===",
+            args.input, output_path,
+        )
+        print(f"\nREWEIGHT MODE: loading {output_path} ...")
+        records = load_json(output_path)
+        if not records:
+            logger.error("Output file not found or empty: %s -- run full phase 3 first.", output_path)
+            return
+        logger.info("Loaded %d records from %s", len(records), output_path)
+
+        surviving = [r for r in records if r["status"] in _SURVIVING]
+        print(f"Re-blending aesthetic_score for {len(surviving)} surviving records ...")
+        print(f"  Weights: BRISQUE×{config.BRISQUE_BLEND_WEIGHT}  "
+              f"LAION×{config.LAION_BLEND_WEIGHT}  MUSIQ×{config.MUSIQ_BLEND_WEIGHT}")
+
+        for record in surviving:
+            record["aesthetic_score"] = round(
+                blend_aesthetic_scores(
+                    record.get("brisque_score"),
+                    record.get("laion_score"),
+                    record.get("musiq_score"),
+                ),
+                6,
+            )
+
+        records = step3_combine(records, logger)
+        step4_output(records, logger, output_path)
+        elapsed = time.time() - start
+        logger.info("=== Phase 3 REWEIGHT complete in %.1fs ===", elapsed)
+        print(f"\nReweight complete in {elapsed:.1f}s")
+        return
+
     logger.info(
         "=== Phase 3 started  input=%s  output=%s  test=%s  "
-        "skip_nima=%s  skip_llava=%s  skip_composition=%s  resume=%s ===",
+        "skip_nima=%s  skip_musiq=%s  skip_llava=%s  skip_composition=%s  resume=%s ===",
         args.input, output_path, args.test,
-        args.skip_nima, args.skip_llava,
+        args.skip_nima, args.skip_musiq, args.skip_llava,
         args.skip_composition, args.resume,
     )
 
@@ -1306,17 +1545,25 @@ def main():
         print(msg)
         logger.info(msg)
 
-    # Step 1 — LAION aesthetic (or BRISQUE fallback)
+    # Step 1 — LAION + BRISQUE + MUSIQ aesthetic blend
     if args.skip_nima:
-        model, nima_method  = None, "brisque"
-        laion_components    = None
+        model, nima_method = None, "brisque"
+        laion_components   = None
     else:
-        laion_components    = _load_laion_model(logger)
-        model, nima_method  = load_nima_model(logger)
+        laion_components   = _load_laion_model(logger)
+        model, nima_method = load_nima_model(logger)
+
+    if args.skip_musiq:
+        musiq_components = None
+        logger.info("MUSIQ: skipped via --skip-musiq")
+    else:
+        musiq_components = _load_musiq_model(logger)
 
     records = step1_nima(
         records, logger, model, nima_method, args.skip_nima,
         laion_components=laion_components,
+        musiq_components=musiq_components,
+        checkpoint_path=None if args.test else output_path,
     )
 
     # Save aesthetic checkpoint immediately — allows resuming before LLaVA

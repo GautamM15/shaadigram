@@ -37,9 +37,14 @@ MEMORABILITY_WEIGHT = 0.15
 # LIGHTING_WEIGHT removed — replaced by ROT_WEIGHT + PROMINENCE_WEIGHT
 
 # Phase 3 — LAION aesthetic predictor
-LAION_WEIGHT        = 0.25   # replaces NIMA_WEIGHT in new formula
+LAION_WEIGHT        = 0.25   # weight of aesthetic_score in final formula
 LAION_MODEL_PATH    = "aesthetic_model.pth"   # auto-downloaded on first run
 LAION_MODEL_URL     = "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_vit_b_32_linear.pth?raw=true"
+
+# Phase 3 — Aesthetic blend weights (BRISQUE + LAION + MUSIQ → aesthetic_score; must sum to 1.0)
+BRISQUE_BLEND_WEIGHT = 0.20
+LAION_BLEND_WEIGHT   = 0.40
+MUSIQ_BLEND_WEIGHT   = 0.40
 
 # Phase 3 — Composition scoring
 ROT_WEIGHT          = 0.10   # rule-of-thirds face alignment
