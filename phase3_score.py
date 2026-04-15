@@ -53,31 +53,22 @@ try:
     _TORCH_AVAILABLE = True
 
     class _LAIONPredictor(_nn.Module):
-        """Lightweight MLP aesthetic predictor (LAION improved-aesthetic-predictor).
+        """Single linear aesthetic predictor (LAION aesthetic-predictor, vit_b_32 variant).
 
-        Expects unit-normalised CLIP ViT-L/14 embeddings (768-dim) as input.
+        Expects unit-normalised CLIP ViT-B/32 embeddings (512-dim) as input.
         Outputs a single score (1-10 scale before external normalisation).
 
-        Weight file: sa_0_4_vit_l_14_linear.pth from
-        https://github.com/christophschuhmann/improved-aesthetic-predictor/releases
-        Save as aesthetic_model.pth in the project root.
+        Weight file: sa_0_4_vit_b_32_linear.pth from
+        https://github.com/LAION-AI/aesthetic-predictor
+        Auto-downloaded to aesthetic_model.pth on first run.
         """
         def __init__(self):
             super().__init__()
-            self.layers = _nn.Sequential(
-                _nn.Linear(768, 1024),
-                _nn.Dropout(0.2),
-                _nn.Linear(1024, 128),
-                _nn.Dropout(0.2),
-                _nn.Linear(128, 64),
-                _nn.Dropout(0.1),
-                _nn.Linear(64, 16),
-                _nn.Linear(16, 1),
-            )
+            self.linear = _nn.Linear(512, 1)
 
         def forward(self, x):
-            """Forward pass through the MLP."""
-            return self.layers(x)
+            """Forward pass — single linear layer."""
+            return self.linear(x)
 
 except ImportError:
     _TORCH_AVAILABLE = False
@@ -237,57 +228,78 @@ def score_brisque(image_path: str) -> float:
 # ── LAION aesthetic model ─────────────────────────────────────────────────────
 
 def _load_laion_model(logger) -> tuple:
-    """Load CLIP ViT-L/14 + LAION MLP aesthetic predictor.
+    """Load LAION aesthetic predictor — two-tier with auto-download.
 
-    Requires:
-        - transformers and torch installed
-        - aesthetic_model.pth in project root (sa_0_4_vit_l_14_linear.pth from
-          https://github.com/christophschuhmann/improved-aesthetic-predictor/releases)
+    Tier 1 (pip): Try ``from aesthetic_predictor import predict_aesthetic``.
+        Returns (predict_aesthetic_fn, None, None, None).  score_laion_single
+        detects this by checking ``clip_processor is None``.
+
+    Tier 2 (manual): Auto-download sa_0_4_vit_b_32_linear.pth from
+        config.LAION_MODEL_URL on first run.  Load CLIP ViT-B/32 (512-dim,
+        consistent with clip_embeddings.npz from phase 2) + nn.Linear(512, 1).
+        Returns (clip_model, processor, mlp, device).
+
+    Falls through to BRISQUE (returns four Nones) if both tiers fail.
 
     Args:
         logger: Logger instance.
 
     Returns:
-        Tuple (clip_model, clip_processor, laion_mlp, device) on success, or
-        (None, None, None, None) if any dependency is missing / load fails.
-        GPU memory is freed by the caller after scoring completes.
+        4-tuple consumed by score_laion_single / step1_nima.
+        GPU memory freed by the caller after scoring completes.
     """
+    # ── Tier 1: pip aesthetic-predictor package ───────────────────────────────
+    try:
+        from aesthetic_predictor import predict_aesthetic  # noqa: PLC0415
+        logger.info("LAION: using aesthetic-predictor pip package")
+        return predict_aesthetic, None, None, None
+    except ImportError:
+        pass
+
+    # ── Tier 2: manual weights + CLIP ViT-B/32 ───────────────────────────────
     if not _TORCH_AVAILABLE or not _CLIP_LAION_AVAILABLE:
         logger.warning("LAION: torch/transformers unavailable -- BRISQUE fallback")
         return None, None, None, None
 
     laion_path = config.LAION_MODEL_PATH
+
+    # Auto-download on first run
     if not os.path.exists(laion_path):
-        logger.warning(
-            "LAION: %s not found -- BRISQUE fallback. "
-            "Download sa_0_4_vit_l_14_linear.pth from "
-            "https://github.com/christophschuhmann/improved-aesthetic-predictor/releases "
-            "and save as %s",
-            laion_path, laion_path,
-        )
-        return None, None, None, None
+        import urllib.request
+        url = config.LAION_MODEL_URL
+        logger.info("LAION: downloading weights from %s ...", url)
+        print(f"  Downloading LAION weights from GitHub ...")
+        try:
+            urllib.request.urlretrieve(url, laion_path)
+            size_mb = os.path.getsize(laion_path) / 1_048_576
+            logger.info("LAION: downloaded %.1f MB → %s", size_mb, laion_path)
+            print(f"  Downloaded {size_mb:.1f} MB → {laion_path}")
+        except Exception as exc:
+            logger.warning("LAION: download failed (%s) -- BRISQUE fallback", exc)
+            return None, None, None, None
 
     try:
         device = "cuda" if _torch.cuda.is_available() else "cpu"
-        logger.info("Loading CLIP ViT-L/14 for LAION aesthetic scoring on %s ...", device)
-        processor  = _CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-        clip_model = _CLIPFullModel.from_pretrained(
-            "openai/clip-vit-large-patch14"
-        ).to(device)
+        logger.info("Loading CLIP ViT-B/32 for LAION aesthetic scoring on %s ...", device)
+        processor  = _CLIPImageProcessor.from_pretrained(config.CLIP_MODEL)
+        clip_model = _CLIPFullModel.from_pretrained(config.CLIP_MODEL).to(device)
         clip_model.eval()
 
-        mlp = _LAIONPredictor()
-        state = _torch.load(laion_path, map_location=device)
-        # The LAION checkpoint may be a plain OrderedDict or wrapped in a 'state_dict' key
-        if "state_dict" in state:
-            state = state["state_dict"]
+        mlp   = _LAIONPredictor()
+        state = _torch.load(laion_path, map_location="cpu", weights_only=True)
+        # Weights file is a plain OrderedDict {"linear.weight": ..., "linear.bias": ...}
+        # Older checkpoints may use "weight"/"bias" keys without the "linear." prefix
+        if "weight" in state and "linear.weight" not in state:
+            state = {"linear.weight": state["weight"], "linear.bias": state["bias"]}
         mlp.load_state_dict(state)
         mlp.to(device).eval()
 
-        logger.info("LAION aesthetic model loaded (CLIP ViT-L/14 + MLP)")
+        logger.info("LAION aesthetic model loaded (CLIP ViT-B/32 + Linear(512,1))")
         return clip_model, processor, mlp, device
     except Exception as exc:
         logger.warning("LAION load failed (%s) -- BRISQUE fallback", exc)
+        if os.path.exists(laion_path) and os.path.getsize(laion_path) < 1_000_000:
+            os.remove(laion_path)   # remove likely-corrupt small file
         return None, None, None, None
 
 
@@ -295,26 +307,37 @@ def score_laion_single(path: str, clip_model, clip_processor,
                         laion_mlp, device: str) -> float:
     """Score one image with the LAION aesthetic predictor.
 
-    Encodes the image with CLIP ViT-L/14, then passes the embedding through
-    the LAION MLP to produce a raw score (1-10 scale), normalised to [0, 1].
+    Supports two modes depending on how _load_laion_model() was called:
+
+    * pip mode   (clip_processor is None): clip_model is the predict_aesthetic
+                 callable from the aesthetic-predictor package.
+    * manual mode: clip_model is CLIPModel ViT-B/32; encodes the image to
+                   512-dim and passes through Linear(512, 1).
 
     Args:
         path:            Image file path.
-        clip_model:      Loaded CLIPModel (ViT-L/14).
-        clip_processor:  Loaded CLIPProcessor (ViT-L/14).
-        laion_mlp:       Loaded _LAIONPredictor.
-        device:          "cuda" or "cpu".
+        clip_model:      CLIPModel (ViT-B/32) or predict_aesthetic callable.
+        clip_processor:  CLIPImageProcessor, or None in pip mode.
+        laion_mlp:       Loaded _LAIONPredictor, or None in pip mode.
+        device:          "cuda" or "cpu", or None in pip mode.
 
     Returns:
         Float in [0, 1].  Returns 0.5 on any failure.
     """
     try:
-        img    = Image.open(path).convert("RGB")
+        img = Image.open(path).convert("RGB")
+
+        # ── pip mode ──────────────────────────────────────────────────────────
+        if clip_processor is None:
+            raw = clip_model(img)   # predict_aesthetic returns Tensor shape (1,1), 1-10 scale
+            return float(max(0.0, min(1.0, float(raw.item()) / 10.0)))
+
+        # ── manual mode: CLIP ViT-B/32 + Linear(512, 1) ──────────────────────
         inputs = clip_processor(images=[img], return_tensors="pt")
         pv     = inputs["pixel_values"].to(device)
         with _torch.no_grad():
             vis_out = clip_model.vision_model(pixel_values=pv)
-            feats   = clip_model.visual_projection(vis_out.pooler_output)  # (1, 768)
+            feats   = clip_model.visual_projection(vis_out.pooler_output)  # (1, 512)
             feats   = feats / feats.norm(dim=-1, keepdim=True)
             score   = laion_mlp(feats).squeeze().item()
         return float(max(0.0, min(1.0, score / 10.0)))

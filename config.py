@@ -38,7 +38,8 @@ MEMORABILITY_WEIGHT = 0.15
 
 # Phase 3 — LAION aesthetic predictor
 LAION_WEIGHT        = 0.25   # replaces NIMA_WEIGHT in new formula
-LAION_MODEL_PATH    = "aesthetic_model.pth"   # download sa_0_4_vit_l_14_linear.pth from LAION GitHub
+LAION_MODEL_PATH    = "aesthetic_model.pth"   # auto-downloaded on first run
+LAION_MODEL_URL     = "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_vit_b_32_linear.pth?raw=true"
 
 # Phase 3 — Composition scoring
 ROT_WEIGHT          = 0.10   # rule-of-thirds face alignment

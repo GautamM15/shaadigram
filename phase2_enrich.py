@@ -627,6 +627,8 @@ def _load_clip_model(logger) -> tuple:
 def _embed_batch(model, processor, pil_images: list, device: str) -> np.ndarray:
     """Encode a batch of PIL images with CLIP visual encoder.
 
+    Falls back to CPU automatically if the requested device runs out of memory.
+
     Args:
         model:      CLIPModel instance.
         processor:  CLIPProcessor instance.
@@ -637,12 +639,25 @@ def _embed_batch(model, processor, pil_images: list, device: str) -> np.ndarray:
         Float32 numpy array of shape (B, 512), L2-normalised.
     """
     import torch
-    inputs = processor(images=pil_images, return_tensors="pt")
-    pv     = inputs["pixel_values"].to(device)
-    with torch.no_grad():
-        vis_out = model.vision_model(pixel_values=pv)
-        feats   = model.visual_projection(vis_out.pooler_output)  # (B, 512)
-    feats = feats.cpu().float().numpy()
+
+    def _run(dev):
+        inputs = processor(images=pil_images, return_tensors="pt")
+        pv     = inputs["pixel_values"].to(dev)
+        with torch.no_grad():
+            vis_out = model.vision_model(pixel_values=pv)
+            feats   = model.visual_projection(vis_out.pooler_output)  # (B, 512)
+        return feats.cpu().float().numpy()
+
+    try:
+        feats = _run(device)
+    except (RuntimeError, torch.cuda.OutOfMemoryError):
+        # CUDA OOM or similar — retry on CPU
+        if device != "cpu":
+            torch.cuda.empty_cache()
+            feats = _run("cpu")
+        else:
+            raise
+
     norms = np.linalg.norm(feats, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     return feats / norms
@@ -760,6 +775,10 @@ def step6_clip_embeddings(records: list, logger,
         for r in batch:
             try:
                 img = Image.open(r["path"]).convert("RGB")
+                # Pre-resize to max 800px — CLIP crops to 224 anyway.
+                # Prevents multi-GB numpy arrays from 42MP+ wedding photos.
+                if max(img.size) > 800:
+                    img.thumbnail((800, 800), Image.LANCZOS)
                 pil_imgs.append(img)
                 valid_batch.append(r)
             except Exception as exc:
@@ -1049,6 +1068,15 @@ def main():
         dest="skip_clip",
         help="Skip CLIP embedding step (step 6); clip_event_tags will be [] for all photos",
     )
+    parser.add_argument(
+        "--resume-clip",
+        action="store_true",
+        dest="resume_clip",
+        help=(
+            "Skip steps 2-5 and resume from *_step5.json checkpoint "
+            "(use when step 6 CLIP crashed after a completed enrichment run)"
+        ),
+    )
     args = parser.parse_args()
 
     logger = setup_logging("phase2_enrich")
@@ -1079,13 +1107,30 @@ def main():
         print(msg)
         logger.info(msg)
 
-    enrollments = load_enrollments(logger)
-    records     = step2_exif_moments(records, logger)
-    records     = step3_4_5_enrich(
-        records, enrollments, logger,
-        include_emotion=args.include_emotion,
-        debug_face=args.debug_face,
-    )
+    # Intermediate checkpoint path — lives next to the output file
+    _step5_path = args.output.replace(".json", "_step5.json")
+
+    if args.resume_clip:
+        # Skip steps 2-5; load enriched records from the step5 checkpoint
+        records = load_json(_step5_path)
+        if not records:
+            logger.error("--resume-clip: checkpoint not found: %s -- exiting.", _step5_path)
+            print(f"ERROR: step5 checkpoint not found: {_step5_path}")
+            return
+        logger.info("--resume-clip: loaded %d records from checkpoint %s", len(records), _step5_path)
+        print(f"Resuming CLIP from checkpoint ({len(records)} records)")
+    else:
+        enrollments = load_enrollments(logger)
+        records     = step2_exif_moments(records, logger)
+        records     = step3_4_5_enrich(
+            records, enrollments, logger,
+            include_emotion=args.include_emotion,
+            debug_face=args.debug_face,
+        )
+        # Save intermediate checkpoint so a CLIP crash doesn't require a full re-run
+        save_json(records, _step5_path)
+        logger.info("Saved step5 checkpoint → %s", _step5_path)
+
     records     = step6_clip_embeddings(
         records, logger,
         output_path=config.CLIP_EMBEDDINGS_FILE,

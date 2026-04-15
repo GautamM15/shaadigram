@@ -21,26 +21,19 @@ import config
 # ── Download targets ──────────────────────────────────────────────────────────
 
 _LAION_DEST     = config.LAION_MODEL_PATH   # "aesthetic_model.pth"
-
-# Try these sources in order until one succeeds
-_LAION_URLS = [
-    # GitHub raw (may work if file is not LFS)
-    "https://github.com/christophschuhmann/improved-aesthetic-predictor/raw/main/sa_0_4_vit_l_14_linear.pth",
-    # GitHub LFS-compatible download API
-    "https://media.githubusercontent.com/media/christophschuhmann/improved-aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth",
-    # GitHub release asset (if tagged)
-    "https://github.com/christophschuhmann/improved-aesthetic-predictor/releases/download/pred_models/sa_0_4_vit_l_14_linear.pth",
-]
+_LAION_URLS     = [config.LAION_MODEL_URL]  # sa_0_4_vit_b_32_linear.pth from LAION-AI
 
 
 # ── Step 1 — Download LAION aesthetic model ───────────────────────────────────
 
 def download_laion(dest: str = _LAION_DEST) -> bool:
-    """Download the LAION MLP aesthetic predictor weights via huggingface_hub.
+    """Download the LAION aesthetic predictor weights (sa_0_4_vit_b_32_linear.pth).
 
-    Uses hf_hub_download() which handles auth headers, redirects, and caching
-    automatically.  Copies the cached file to dest in the project root.
+    Source: https://github.com/LAION-AI/aesthetic-predictor
+    Architecture: nn.Linear(512, 1) — single linear layer on CLIP ViT-B/32 embeddings.
 
+    First checks for the aesthetic-predictor pip package (which bundles the weights).
+    Falls back to direct GitHub download if the package is unavailable.
     Skips download if dest already exists and is larger than 1 MB.
 
     Args:
@@ -52,6 +45,14 @@ def download_laion(dest: str = _LAION_DEST) -> bool:
     print("\n" + "=" * 56)
     print("  Step 1 — LAION aesthetic model (aesthetic_model.pth)")
     print("=" * 56)
+
+    # Check pip package first — if installed it handles weights internally
+    try:
+        from aesthetic_predictor import predict_aesthetic  # noqa: F401
+        print("  aesthetic-predictor pip package found — weights bundled, no download needed")
+        return True
+    except ImportError:
+        print("  aesthetic-predictor pip package not installed — trying direct download")
 
     if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000:
         size_mb = os.path.getsize(dest) / 1_048_576
@@ -130,9 +131,10 @@ def download_laion(dest: str = _LAION_DEST) -> bool:
 
     print(f"\n  All sources failed (last error: {last_error})")
     print("  Manual download:")
-    print("    1. Go to: https://github.com/christophschuhmann/improved-aesthetic-predictor")
-    print("    2. Download sa_0_4_vit_l_14_linear.pth")
-    print(f"   3. Save as: {os.path.abspath(dest)}")
+    print("    1. Go to: https://github.com/LAION-AI/aesthetic-predictor")
+    print("    2. Download sa_0_4_vit_b_32_linear.pth")
+    print(f"    3. Save as: {os.path.abspath(dest)}")
+    print("  OR: pip install aesthetic-predictor")
     print("  Without this file, phase 3 will use BRISQUE (works fine).")
     return False
 
@@ -250,7 +252,6 @@ def main() -> None:
     results = {}
     results["laion"]       = download_laion()
     results["clip_b32"]    = verify_clip_b32()
-    results["clip_l14"]    = verify_clip_l14()
 
     # ── Final report ──────────────────────────────────────────────────────────
     w = 56
@@ -258,9 +259,8 @@ def main() -> None:
     print("  Summary")
     print("=" * w)
     labels = {
-        "laion":    "LAION aesthetic_model.pth",
-        "clip_b32": "CLIP ViT-B/32 (phase 2)",
-        "clip_l14": "CLIP ViT-L/14 (phase 3)",
+        "laion":    "LAION aesthetic_model.pth (vit_b_32)",
+        "clip_b32": "CLIP ViT-B/32 (phase 2 + phase 3)",
     }
     all_ok = True
     for key, label in labels.items():
