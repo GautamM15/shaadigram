@@ -10,7 +10,7 @@
 - phase3_score.py ✅ — +MUSIQ scoring (pyiqa), +aesthetic blend (BRISQUE×0.20+LAION×0.40+MUSIQ×0.40->aesthetic_score), +--reweight flag, +--skip-musiq flag; +LAION aesthetic, +composition, +burst compare
 - phase4_select.py ✅ — +MMR selection (lambda=0.7, CLIP embeddings, moment cap), --no-mmr flag, mmr_score field
 - config.py ✅ — EMOTION_WEIGHT 0.40->0.35, +LAION_WEIGHT/ROT_WEIGHT/PROMINENCE_WEIGHT/DISTRACTION_PENALTY/BURST_RANK_BONUS/PENALTY/CLIP_*/MMR_LAMBDA
-- phase1_filter.py ✅ — --scan-report (Pass A filename dedup + Pass B phash dedup + step1_ingest pre-filter)
+- phase1_filter.py ✅ — --scan-report (phash-only dedup; filename dedup removed — cameras reuse filenames across folders)
 - phase1b_burst.py ✅ — burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
 - run_pipeline.py ✅ — 7-phase pipeline runner (--from/--only/--skip-review/--dry-run)
 - phase5_review.py ✅ — CANDID review complete: 800 reviewed, 80 approved (10%), 1 person tagged, 0 errors

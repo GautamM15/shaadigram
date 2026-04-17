@@ -1,5 +1,5 @@
 ## Last Updated
-2026-04-17 (Phase 5 CANDID review complete — 80 approved)
+2026-04-17 (scan report fix — filename dedup removed, phash-only)
 
 ## Current Status
 Eng-review fixes — COMPLETE (2026-04-15)
@@ -86,8 +86,8 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 - Gautam identification is manual in Phase 5 review UI — not automated in phase 4
 
 ## Pre-21k Improvements (2026-04-14)
-- phase1_filter.py: --scan-report flag (Pass A filename dedup + Pass B phash, ThreadPool, draft mode)
-- phase1_filter.py: step1_ingest reads scan_report.json on startup and pre-filters known dupes
+- phase1_filter.py: --scan-report flag (phash-only dedup; filename dedup Pass A removed 2026-04-17 — cameras reuse filenames across folders, so same filename ≠ same photo)
+- phase1_filter.py: step1_ingest reads scan_report.json on startup and pre-filters known phash dupes
 - phase2_enrich.py: capture_time field added per surviving record (ISO string from EXIF)
 - phase2_enrich.py: MOMENT_SUBFOLDER_FALLBACK=True — no-EXIF photos get moment_label from parent directory, moment_id starting at 10001
 - phase1b_burst.py: new phase between phase2 and phase3; BURST_MAX_KEEP=3, BURST_SEQUENCE_GAP=5; EXIF 2-min windows, fallback to filename-seq proximity

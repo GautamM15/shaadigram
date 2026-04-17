@@ -307,7 +307,6 @@ def cluster_duplicates(records: list) -> list:
     uf = UnionFind(n)
 
     # Shard by parent folder before the O(N²) comparison.
-    # Cross-folder filename duplicates are already caught by --scan-report Pass A.
     # Near-duplicates (burst shots, slight reframes) are always in the same subfolder.
     # At 21k photos this reduces ~220M comparisons to ~245k per moment subfolder.
     folder_buckets: dict = defaultdict(list)
@@ -718,16 +717,12 @@ def sr_step4_write(
         logger:       Logger instance.
         cache_stats:  Optional dict {"reused": N, "computed": M} from sr_step3.
     """
-    total          = len(all_files)
-    fn_dup_groups  = len(dup_groups)
-    fn_kept        = fn_dup_groups                           # one keeper per group
-    fn_skipped     = sum(len(g["entries"]) - 1 for g in dup_groups)
+    total           = len(all_files)
     hash_dup_groups = len(hash_groups)
-    hash_skipped   = sum(1 for g in hash_groups for e in g["entries"] if e["decision"] == "skip")
-    unique_after_a = total - fn_skipped
-    est_unique     = total - len(skip_paths)
-    phase1_rate    = 0.87   # seconds per photo from CANDID test run
-    est_hours      = est_unique * phase1_rate / 3600
+    hash_skipped    = sum(1 for g in hash_groups for e in g["entries"] if e["decision"] == "skip")
+    est_unique      = total - len(skip_paths)
+    phase1_rate     = 0.87   # seconds per photo from CANDID test run
+    est_hours       = est_unique * phase1_rate / 3600
 
     w = 48
 
@@ -737,33 +732,19 @@ def sr_step4_write(
         f" SCAN REPORT -- {scan_folder}",
         "-" * w,
         f" Total files found          : {total:>8,}",
-        f" Unique filenames           : {total - fn_skipped:>8,}",
-        f" Filename duplicates found  : {fn_skipped:>8,}",
-        f"   -> kept (highest res)    : {fn_kept:>8,}",
-        f"   -> marked duplicate      : {fn_skipped:>8,}",
         f" Hash duplicates found      : {hash_skipped:>8,}",
         *(
             [f"   -> {cache_stats['reused']} reused / {cache_stats['computed']} computed fresh"]
             if cache_stats and (cache_stats["reused"] or cache_stats["computed"])
             else []
         ),
+        f" Unique after dedup         : {est_unique:>8,}",
         "-" * w,
         " FOLDER BREAKDOWN",
         "-" * w,
     ]
     for folder, count in sorted(folder_counts.items(), key=lambda x: -x[1]):
         lines.append(f"  /{folder:<38}: {count:>6,}")
-
-    lines += [
-        "-" * w,
-        " DUPLICATE DETAIL (filename dupes)",
-        "-" * w,
-    ]
-    for g in dup_groups:
-        lines.append(f" {g['filename']} -> found in {len(g['entries'])} folders:")
-        for e in g["entries"]:
-            tag  = "KEEP" if e["decision"] == "keep" else "SKIP"
-            lines.append(f"   {tag}   {e['folder']:<32} {e['res']}  ({e['size_mb']}MB)")
 
     if hash_groups:
         lines += ["-" * w, " DUPLICATE DETAIL (hash dupes, top 20)", "-" * w]
@@ -794,7 +775,6 @@ def sr_step4_write(
         "skip":                  sorted(skip_paths),
         "keep":                  sorted(keep_paths),
         "folder_counts":         folder_counts,
-        "filename_dup_groups":   dup_groups,
         "hash_dup_groups":       hash_groups,
     }
     with open(config.SCAN_REPORT_JSON, "w", encoding="utf-8") as f:
@@ -828,17 +808,17 @@ def run_scan_report(scan_folder: str, logger) -> None:
         print("No supported image files found.")
         return
 
-    keepers_a, dupes_a, dup_groups = sr_step2_filename_dedup(all_files, logger)
     final_keep_paths, hash_dupe_paths, hash_groups, cache_stats = sr_step3_hash_dedup(
-        keepers_a, logger
+        all_files, logger
     )
 
-    # Build unified skip set (filename dupes + hash dupes)
-    skip_paths: set[str] = {f["path"] for f in dupes_a} | hash_dupe_paths
+    # Skip set is phash dupes only (filename dedup removed — different cameras
+    # reuse the same filenames, so filename alone is not a reliable signal).
+    skip_paths = hash_dupe_paths
 
     sr_step4_write(
         scan_folder, all_files, folder_counts,
-        dup_groups, hash_groups,
+        [], hash_groups,
         skip_paths, final_keep_paths,
         logger,
         cache_stats=cache_stats,
