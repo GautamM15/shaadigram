@@ -1,5 +1,5 @@
 ## Last Updated
-2026-04-15 (eng-review fixes — 9 issues patched)
+2026-04-17 (Phase 5 CANDID review complete — 80 approved)
 
 ## Current Status
 Eng-review fixes — COMPLETE (2026-04-15)
@@ -34,8 +34,8 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 | 1 | phase1_filter.py | ✅ Complete | surviving_photos_candid.json |
 | 2 | phase2_enrich.py | ✅ Complete, full run done | enriched_photos_candid.json |
 | 3 | phase3_score.py | ✅ Complete, re-run done (LAION) | scored_photos_candid.json |
-| 4 | phase4_select.py | ⏳ Running | selected_photos_candid.json |
-| 5 | phase5_review.py | ✅ Complete | review_progress.json + output/album_approved/ |
+| 4 | phase4_select.py | ✅ Complete | selected_photos_candid.json |
+| 5 | phase5_review.py | ✅ Complete | review_progress.json + output/album_approved/ (80 approved) |
 | 6 | phase6_export.py | ⏳ Not started | - |
 | - | enroll_face.py | ✅ Complete | {name}_face.pkl |
 
@@ -70,6 +70,11 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
   - Output: selected_photos_candid.json (1,521 records, in_top800 + selection_rank on every record)
   - Gautam identification removed from phase 4 — done manually in phase 5 review UI
 - Final album selection: 800 (top 800 selected)
+- Phase 5 CANDID review (2026-04-17):
+  - 800 photos reviewed, 80 approved (10% acceptance rate)
+  - 1 person tagged (G=gautam)
+  - 0 errors
+  - Output: output/album_approved/
 
 ## Decisions Made
 - Candid photos protected via soft_blur tier (not hard rejected)

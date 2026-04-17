@@ -13,8 +13,9 @@
 - phase1_filter.py ✅ — --scan-report (Pass A filename dedup + Pass B phash dedup + step1_ingest pre-filter)
 - phase1b_burst.py ✅ — burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
 - run_pipeline.py ✅ — 7-phase pipeline runner (--from/--only/--skip-review/--dry-run)
-- phase5_review.py ✅ — tkinter review UI
-- Next: full 21k pipeline run (see Phase Order below). NOTE: phase2 re-run on CANDID needed to populate face_bboxes for composition scoring.
+- phase5_review.py ✅ — CANDID review complete: 800 reviewed, 80 approved (10%), 1 person tagged, 0 errors
+- README.md ✅ — added for public repo (2026-04-17)
+- Next: full 21k pipeline run (see Phase Order below).
 
 ## Non-Negotiable Rules
 - NEVER delete, move, or modify original photo files
