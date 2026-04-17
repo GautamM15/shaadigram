@@ -571,12 +571,14 @@ def enrich_single_photo(record: dict, enrollments: dict, logger,
 
 def step3_4_5_enrich(records: list, enrollments: dict, logger,
                       include_emotion: bool = False,
-                      debug_face: bool = False) -> list:
+                      debug_face: bool = False,
+                      checkpoint_path: str = None) -> list:
     """Run face detection, shot classification, and smile/eye detection.
 
     Processes only surviving records in a single tqdm pass.  Non-surviving
     records receive the null enrichment block and are passed through
-    unchanged.
+    unchanged.  Saves a checkpoint every PHASE2_CHECKPOINT_INTERVAL photos
+    so a crash loses at most ~500 photos of work instead of the entire run.
 
     Args:
         records:         All records from phase 1 (including rejected ones).
@@ -584,17 +586,25 @@ def step3_4_5_enrich(records: list, enrollments: dict, logger,
         logger:          Logger instance.
         include_emotion: Pass through to enrich_single_photo().
         debug_face:      Print raw similarity scores for first 5 face photos.
+        checkpoint_path: If set, save incremental checkpoint every N photos.
 
     Returns:
         All records with enrichment fields populated.
     """
     surviving = [r for r in records if r["status"] in _SURVIVING]
     skipped   = [r for r in records if r["status"] not in _SURVIVING]
+
+    # Skip already-enriched records (resume support)
+    to_enrich = [r for r in surviving if r.get("faces_detected") is None]
+    already   = len(surviving) - len(to_enrich)
+
     logger.info(
-        "Step 3+4+5 -- enriching %d surviving photos (%d skipped)  "
+        "Step 3+4+5 -- enriching %d surviving photos (%d already done, %d skipped)  "
         "include_emotion=%s  debug_face=%s",
-        len(surviving), len(skipped), include_emotion, debug_face,
+        len(to_enrich), already, len(skipped), include_emotion, debug_face,
     )
+    if already:
+        print(f"  Resuming: {already} already enriched, {len(to_enrich)} remaining")
 
     # Disable person matching when only gautam is enrolled — he is tagged manually
     if set(enrollments.keys()) == {"gautam"}:
@@ -611,13 +621,22 @@ def step3_4_5_enrich(records: list, enrollments: dict, logger,
         r.update(_NULL_ENRICHMENT)
 
     debug_counter = [0]   # mutable counter shared across all enrich calls
-    for record in tqdm(surviving, desc="Enriching photos", unit="photo"):
+    interval = config.PHASE2_CHECKPOINT_INTERVAL
+    for i, record in enumerate(tqdm(to_enrich, desc="Enriching photos", unit="photo"), 1):
         enrich_single_photo(
             record, enrollments, logger,
             include_emotion=include_emotion,
             debug_face=debug_face,
             debug_counter=debug_counter,
         )
+        if checkpoint_path and i % interval == 0:
+            save_json(checkpoint_path, records)
+            logger.info("Checkpoint saved at %d/%d photos", already + i, len(surviving))
+
+    # Final checkpoint after loop completes
+    if checkpoint_path and to_enrich:
+        save_json(checkpoint_path, records)
+        logger.info("Enrichment checkpoint saved (%d total)", len(surviving))
 
     logger.info("Step 3+4+5 complete")
     return records
@@ -1099,6 +1118,14 @@ def main():
         help="Skip CLIP embedding step (step 6); clip_event_tags will be [] for all photos",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume enrichment from the output file (skips already-enriched photos). "
+            "Use after a crash during steps 3-5. Step 2 (moments) is re-run quickly."
+        ),
+    )
+    parser.add_argument(
         "--resume-clip",
         action="store_true",
         dest="resume_clip",
@@ -1117,18 +1144,29 @@ def main():
         return
     start  = time.time()
     logger.info(
-        "=== Phase 2 started  input=%s  output=%s  test=%s  "
+        "=== Phase 2 started  input=%s  output=%s  test=%s  resume=%s  "
         "include_emotion=%s  debug_face=%s  skip_clip=%s ===",
-        args.input, args.output, args.test,
+        args.input, args.output, args.test, args.resume,
         args.include_emotion, args.debug_face, args.skip_clip,
     )
 
-    records = load_json(args.input)
-    if not records:
-        logger.error("Could not load input file: %s -- exiting.", args.input)
-        return
-
-    logger.info("Loaded %d records from %s", len(records), args.input)
+    # --resume: load partially-enriched records from the output file
+    if args.resume:
+        records = load_json(args.output)
+        if not records:
+            logger.error("--resume: output file not found: %s -- exiting.", args.output)
+            print(f"ERROR: cannot resume, output file not found: {args.output}")
+            return
+        enriched_ct = sum(1 for r in records if r.get("faces_detected") is not None)
+        logger.info("--resume: loaded %d records from %s (%d already enriched)",
+                     len(records), args.output, enriched_ct)
+        print(f"Resuming from {args.output} ({enriched_ct} already enriched)")
+    else:
+        records = load_json(args.input)
+        if not records:
+            logger.error("Could not load input file: %s -- exiting.", args.input)
+            return
+        logger.info("Loaded %d records from %s", len(records), args.input)
 
     if args.test:
         total_surviving = sum(1 for r in records if r["status"] in _SURVIVING)
@@ -1156,9 +1194,10 @@ def main():
             records, enrollments, logger,
             include_emotion=args.include_emotion,
             debug_face=args.debug_face,
+            checkpoint_path=args.output,
         )
         # Save intermediate checkpoint so a CLIP crash doesn't require a full re-run
-        save_json(records, _step5_path)
+        save_json(_step5_path, records)
         logger.info("Saved step5 checkpoint → %s", _step5_path)
 
     records     = step6_clip_embeddings(

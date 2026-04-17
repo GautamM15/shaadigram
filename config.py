@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────
 
 # Input
-INPUT_FOLDER = "E:\\Shagun Sid Wedding"
+INPUT_FOLDER = "E:\\Shagun Sid Wedding\\EDITED DATA\\PHOTOGRAPHS\\FULL SET"
 
 # Phase 1 — filter thresholds
 BLUR_THRESHOLD = 100
@@ -104,6 +104,9 @@ SCAN_REPORT_WORKERS = 4           # threads for phash pass in --scan-report
 
 # Improvement 2 — subfolder moment fallback (phase2_enrich.py)
 MOMENT_SUBFOLDER_FALLBACK = True  # False = old "unknown" behavior for no-EXIF photos
+
+# Phase 2 — enrichment checkpoints
+PHASE2_CHECKPOINT_INTERVAL = 500  # save enrichment progress every N photos
 
 # Improvement 3 — burst limiter (phase1b_burst.py)
 BURST_MAX_KEEP     = 3            # max photos to keep per burst group

@@ -249,7 +249,7 @@ def process_single_photo(path: str) -> dict:
         )
 
     except Exception as exc:
-        logging.getLogger(__name__).debug(
+        logging.getLogger(__name__).warning(
             "Error processing %s: %s", os.path.basename(path), exc
         )
 
@@ -637,10 +637,18 @@ def sr_step3_hash_dedup(keepers: list, logger) -> tuple:
     n = len(hashable)
     hash_objs = [imagehash.hex_to_hash(path_to_hash[f["path"]]) for f in hashable]
 
+    # Two-tier threshold: strict for cross-folder (different cameras may produce
+    # similar-looking photos that aren't actual duplicates), normal for same-folder.
+    cross_threshold = config.DUPLICATE_HASH_THRESHOLD // 2   # 4 for default 8
+    same_threshold  = config.DUPLICATE_HASH_THRESHOLD         # 8
+
     uf = UnionFind(n)
     for a in range(n):
+        folder_a = hashable[a].get("folder_rel", "")
         for b in range(a + 1, n):
-            if hash_objs[a] - hash_objs[b] <= config.DUPLICATE_HASH_THRESHOLD:
+            dist = hash_objs[a] - hash_objs[b]
+            threshold = same_threshold if hashable[b].get("folder_rel", "") == folder_a else cross_threshold
+            if dist <= threshold:
                 uf.union(a, b)
 
     groups: dict[int, list] = defaultdict(list)
@@ -777,8 +785,7 @@ def sr_step4_write(
         "folder_counts":         folder_counts,
         "hash_dup_groups":       hash_groups,
     }
-    with open(config.SCAN_REPORT_JSON, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
+    save_json(config.SCAN_REPORT_JSON, report)
 
     logger.info(
         "SR step 4 -- wrote %s and %s",
@@ -877,12 +884,18 @@ def step1_ingest(input_folder: str, logger, limit: int = None) -> list:
             before = len(all_paths)
             all_paths = [p for p in all_paths if p not in skip_set]
             skipped = before - len(all_paths)
-            logger.info(
-                "scan_report.json loaded -- pre-filtered %d known duplicates "
-                "(%d filename-dupes + hash-dupes)",
-                skipped, skipped,
-            )
-            print(f"  scan_report.json: pre-filtered {skipped} known duplicates")
+            if skipped == 0:
+                logger.warning(
+                    "scan_report.json loaded but 0 paths matched — report may be "
+                    "stale or generated from a different folder"
+                )
+                print("  WARNING: scan_report.json matched 0 paths (stale report?)")
+            else:
+                logger.info(
+                    "scan_report.json loaded -- pre-filtered %d known duplicates",
+                    skipped,
+                )
+                print(f"  scan_report.json: pre-filtered {skipped} known duplicates")
         except Exception as exc:
             logger.warning("Could not load scan_report.json: %s", exc)
 

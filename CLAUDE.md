@@ -1,16 +1,13 @@
 # Wedding Photo Curator — Claude Code Rules
 
 ## Current Status
-- Last completed: Eng-review fixes ✅ (9 issues — 2026-04-15)
+- Last completed: Pre-21k code review fixes ✅ (7 issues — 2026-04-17)
 - utils.py ✅ — atomic JSON writes (tmp+os.replace); all checkpoints now crash-safe
-- phase1_filter.py ✅ — error logging in process_single_photo; phash dedup sharded by folder (O(N²) -> O(N²/buckets))
-- phase2_enrich.py ✅ — DeepFace.represent() 60s timeout; face_bboxes stored per record
-- phase3_score.py ✅ — manual LAION 800px resize; step_composition reads stored bboxes; _coalesce() fixes zero-score bug; LLaVA payload resized to 1024px
-- phase2_enrich.py ✅ — +step6_clip_embeddings() ViT-B/32, batch=32, clip_embeddings.npz, clip_event_tags, --skip-clip
-- phase3_score.py ✅ — +MUSIQ scoring (pyiqa), +aesthetic blend (BRISQUE×0.20+LAION×0.40+MUSIQ×0.40->aesthetic_score), +--reweight flag, +--skip-musiq flag; +LAION aesthetic, +composition, +burst compare
+- phase1_filter.py ✅ — error logging WARNING (was DEBUG); phash dedup sharded by folder; two-tier phash threshold (cross-folder <=4, same-folder <=8); scan_report.json atomic write via save_json; warning on 0-path scan_report match
+- phase2_enrich.py ✅ — DeepFace 60s timeout; face_bboxes stored; +--resume flag with checkpoint every 500 photos; fixed save_json arg order at step5 checkpoint; +step6_clip_embeddings() ViT-B/32, --skip-clip
+- phase3_score.py ✅ — LAION/MUSIQ/BRISQUE aesthetic blend; composition+burst compare; +ollama stop before LLaVA; +consecutive LLaVA failure detection (10 in a row = abort+checkpoint)
 - phase4_select.py ✅ — +MMR selection (lambda=0.7, CLIP embeddings, moment cap), --no-mmr flag, mmr_score field
-- config.py ✅ — EMOTION_WEIGHT 0.40->0.35, +LAION_WEIGHT/ROT_WEIGHT/PROMINENCE_WEIGHT/DISTRACTION_PENALTY/BURST_RANK_BONUS/PENALTY/CLIP_*/MMR_LAMBDA
-- phase1_filter.py ✅ — --scan-report (phash-only dedup; filename dedup removed — cameras reuse filenames across folders)
+- config.py ✅ — all weights, thresholds, and checkpoint intervals
 - phase1b_burst.py ✅ — burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
 - run_pipeline.py ✅ — 7-phase pipeline runner (--from/--only/--skip-review/--dry-run)
 - phase5_review.py ✅ — CANDID review complete: 800 reviewed, 80 approved (10%), 1 person tagged, 0 errors

@@ -19,6 +19,7 @@ import io
 import json
 import os
 import statistics
+import subprocess
 import time
 import urllib.request
 
@@ -799,10 +800,21 @@ def step2_llava(records: list, logger, skip_llava: bool,
             record["memorability_score"] = 0.5
             record["llava_fallback"]     = False
     else:
+        # Stop any stale Ollama model to free VRAM before loading LLaVA
+        try:
+            subprocess.run(
+                ["ollama", "stop", config.OLLAMA_MODEL],
+                capture_output=True, timeout=15,
+            )
+            logger.info("Ran 'ollama stop %s' to free VRAM", config.OLLAMA_MODEL)
+        except Exception as exc:
+            logger.debug("ollama stop skipped: %s", exc)
+
         print(
             f"\nStep 2: LLaVA scoring  todo={len(todo)}"
             f"  batch_size={config.LLAVA_BATCH_SIZE}"
         )
+        consecutive_failures = 0
         for idx, record in enumerate(
             tqdm(todo, desc="LLaVA scoring", unit="photo")
         ):
@@ -810,6 +822,21 @@ def step2_llava(records: list, logger, skip_llava: bool,
             record["emotion_score"]      = round(emotion, 6)
             record["memorability_score"] = round(memorability, 6)
             record["llava_fallback"]     = fallback
+
+            # Track consecutive failures — Ollama may have died
+            if fallback:
+                consecutive_failures += 1
+                if consecutive_failures >= 10:
+                    logger.critical(
+                        "10 consecutive LLaVA failures — Ollama may be dead. "
+                        "Saving checkpoint and aborting. Resume with --resume."
+                    )
+                    print("\n  CRITICAL: 10 consecutive LLaVA failures. "
+                          "Check if Ollama is still running.")
+                    save_json(output_path, records)
+                    break
+            else:
+                consecutive_failures = 0
 
             if (idx + 1) % config.LLAVA_BATCH_SIZE == 0:
                 time.sleep(config.LLAVA_BATCH_PAUSE)
