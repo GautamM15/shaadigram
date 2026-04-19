@@ -20,7 +20,8 @@ PHASE2_INPUT  = "surviving_photos_candid.json"
 PHASE2_OUTPUT = "enriched_photos_candid.json"
 
 # Phase 4 — selection limits
-MAX_PHOTOS_PER_MOMENT = 15
+MAX_PHOTOS_PER_MOMENT   = 15
+MAX_SHOT_TYPE_FRACTION  = 0.40   # max fraction of top-800 from any one shot type (0 = disabled)
 TOP_N_ALBUM = 800
 FINAL_ALBUM = 200
 TOP_N_PERSON = 100

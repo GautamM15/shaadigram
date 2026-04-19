@@ -1,18 +1,12 @@
 # Wedding Photo Curator — Claude Code Rules
 
 ## Current Status
-- Last completed: Pre-21k code review fixes ✅ (7 issues — 2026-04-17)
-- utils.py ✅ — atomic JSON writes (tmp+os.replace); all checkpoints now crash-safe
-- phase1_filter.py ✅ — error logging WARNING (was DEBUG); phash dedup sharded by folder; two-tier phash threshold (cross-folder <=4, same-folder <=8); scan_report.json atomic write via save_json; warning on 0-path scan_report match
-- phase2_enrich.py ✅ — DeepFace 60s timeout; face_bboxes stored; +--resume flag with checkpoint every 500 photos; fixed save_json arg order at step5 checkpoint; +step6_clip_embeddings() ViT-B/32, --skip-clip
-- phase3_score.py ✅ — LAION/MUSIQ/BRISQUE aesthetic blend; composition+burst compare; +ollama stop before LLaVA; +consecutive LLaVA failure detection (10 in a row = abort+checkpoint)
-- phase4_select.py ✅ — +MMR selection (lambda=0.7, CLIP embeddings, moment cap), --no-mmr flag, mmr_score field
-- config.py ✅ — all weights, thresholds, and checkpoint intervals
-- phase1b_burst.py ✅ — burst limiter phase (between phase2 and phase3); BURST_MAX_KEEP=3
-- run_pipeline.py ✅ — 7-phase pipeline runner (--from/--only/--skip-review/--dry-run)
+- Last completed: Phase 4 full 21k run ✅ (2026-04-19)
+- Phase 3 full run ✅ — 6,831 photos scored; LAION+MUSIQ+BRISQUE blend; 48 LLaVA fallbacks (0.70%); 18h 20m; scored_photos.json
+- Phase 4 full run ✅ — 800/800 selected via MMR (63s); solo 57.5% / group 35.0% / couple 7.5%; selected_photos.json
 - phase5_review.py ✅ — CANDID review complete: 800 reviewed, 80 approved (10%), 1 person tagged, 0 errors
-- README.md ✅ — added for public repo (2026-04-17)
-- Next: full 21k pipeline run (see Phase Order below).
+- All phases 1–4 complete on full 18,588-photo dataset
+- Next: python phase5_review.py (review 800 selected photos from full run)
 
 ## Non-Negotiable Rules
 - NEVER delete, move, or modify original photo files

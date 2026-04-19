@@ -122,7 +122,7 @@ def _load_clip_embeddings(emb_path: str, records: list, logger) -> dict:
 
 
 def _mmr_select(candidates: list, embeddings: dict, n: int,
-                 lambda_: float, moment_count_fn, logger) -> list:
+                 lambda_: float, is_capped_fn, register_fn, logger) -> list:
     """Select n photos using Maximal Marginal Relevance (MMR).
 
     MMR balances quality (final_score) against visual diversity (CLIP cosine
@@ -134,16 +134,17 @@ def _mmr_select(candidates: list, embeddings: dict, n: int,
     For the first pick max_cosine_sim_to_selected = 0 so the highest-scoring
     photo is always selected first.
 
-    Moment caps are enforced: moment_count_fn(record) returns True when a
-    candidate has already reached its cap and must be skipped.
+    Caps are enforced via is_capped_fn; register_fn is called immediately on
+    each chosen photo so caps are updated before the next iteration.
 
     Args:
-        candidates:     List of eligible record dicts with final_score and path.
-        embeddings:     Dict of path → unit-normalised float32 (512,) embedding.
-        n:              Target number of photos to select.
-        lambda_:        MMR trade-off (0 = pure diversity, 1 = pure score).
-        moment_count_fn: Callable(record) → bool — True means "skip (capped)".
-        logger:          Logger instance.
+        candidates:  List of eligible record dicts with final_score and path.
+        embeddings:  Dict of path → unit-normalised float32 (512,) embedding.
+        n:           Target number of photos to select.
+        lambda_:     MMR trade-off (0 = pure diversity, 1 = pure score).
+        is_capped_fn: Callable(record) → bool — True means "skip (capped)".
+        register_fn:  Callable(record) → None — called right after each pick.
+        logger:       Logger instance.
 
     Returns:
         List of selected record dicts (up to n), in selection order.
@@ -159,12 +160,12 @@ def _mmr_select(candidates: list, embeddings: dict, n: int,
         best_score = -1e9
         best_idx   = -1
 
-        # Build (M, 512) matrix from selected embeddings for batch cosine sim
+        # Build (K, 512) matrix from selected embeddings for batch cosine sim
         if sel_embs:
-            sel_matrix = np.stack(sel_embs, axis=0)   # (K, 512)
+            sel_matrix = np.stack(sel_embs, axis=0)
 
         for i, rec in enumerate(remaining):
-            if moment_count_fn(rec):
+            if is_capped_fn(rec):
                 continue
 
             fs = rec.get("final_score", 0.0) or 0.0
@@ -174,7 +175,6 @@ def _mmr_select(candidates: list, embeddings: dict, n: int,
             else:
                 emb = embeddings.get(rec["path"])
                 if emb is None:
-                    # No embedding — treat max_sim as 0 (compete as if novel)
                     max_sim = 0.0
                 else:
                     sims    = sel_matrix @ emb   # (K,)
@@ -192,6 +192,7 @@ def _mmr_select(candidates: list, embeddings: dict, n: int,
         chosen = remaining.pop(best_idx)
         chosen["mmr_score"] = round(best_score, 6)
         selected.append(chosen)
+        register_fn(chosen)   # update caps immediately for next iteration
 
         emb = embeddings.get(chosen["path"])
         if emb is not None:
@@ -235,44 +236,60 @@ def step2_moment_balanced_selection(eligible: list, logger,
         record["selection_rank"] = None
         record.setdefault("mmr_score", None)
 
-    moment_counts: dict = defaultdict(int)
+    moment_counts: dict    = defaultdict(int)
+    shot_type_counts: dict = defaultdict(int)
+    _shot_cap = (
+        int(config.MAX_SHOT_TYPE_FRACTION * config.TOP_N_ALBUM)
+        if config.MAX_SHOT_TYPE_FRACTION > 0 else 0
+    )
 
     def _is_capped(rec: dict) -> bool:
-        """Return True if this record would exceed its moment cap."""
+        """Return True if this record would exceed its moment or shot-type cap."""
         lbl = rec.get("moment_label") or "unknown"
         mid = rec.get("moment_id")
-        if lbl == "unknown":
-            return False
-        return moment_counts[mid] >= config.MAX_PHOTOS_PER_MOMENT
+        if lbl != "unknown" and moment_counts[mid] >= config.MAX_PHOTOS_PER_MOMENT:
+            return True
+        if _shot_cap > 0:
+            shot = rec.get("primary_shot_type") or "unknown"
+            if shot != "unknown" and shot_type_counts[shot] >= _shot_cap:
+                return True
+        return False
 
     def _register(rec: dict) -> None:
-        """Increment the moment counter for a just-selected record."""
+        """Increment moment and shot-type counters for a just-selected record."""
         lbl = rec.get("moment_label") or "unknown"
         mid = rec.get("moment_id")
         if lbl != "unknown":
             moment_counts[mid] += 1
+        shot = rec.get("primary_shot_type") or "unknown"
+        if shot != "unknown":
+            shot_type_counts[shot] += 1
 
     use_mmr = embeddings is not None
     mode    = "MMR" if use_mmr else "greedy"
-    logger.info("Step 2 -- selection mode=%s  target=%d", mode, config.TOP_N_ALBUM)
-    print(f"\nStep 2: selection  mode={mode}  target={config.TOP_N_ALBUM}")
+    logger.info(
+        "Step 2 -- selection mode=%s  target=%d  shot_cap=%s",
+        mode, config.TOP_N_ALBUM,
+        f"{_shot_cap}/type ({config.MAX_SHOT_TYPE_FRACTION:.0%})" if _shot_cap else "disabled",
+    )
+    print(f"\nStep 2: selection  mode={mode}  target={config.TOP_N_ALBUM}  "
+          f"shot_cap={f'{_shot_cap}/type' if _shot_cap else 'disabled'}")
 
     if use_mmr:
         selected_records = _mmr_select(
-            candidates     = sorted(eligible, key=lambda r: r.get("final_score", 0.0), reverse=True),
-            embeddings     = embeddings,
-            n              = config.TOP_N_ALBUM,
-            lambda_        = config.MMR_LAMBDA,
-            moment_count_fn= _is_capped,
-            logger         = logger,
+            candidates  = sorted(eligible, key=lambda r: r.get("final_score", 0.0), reverse=True),
+            embeddings  = embeddings,
+            n           = config.TOP_N_ALBUM,
+            lambda_     = config.MMR_LAMBDA,
+            is_capped_fn= _is_capped,
+            register_fn = _register,
+            logger      = logger,
         )
-        # Register moment counts and set fields
         for rank, rec in enumerate(selected_records, 1):
-            _register(rec)
             rec["in_top800"]      = True
             rec["selection_rank"] = rank
         selected = len(selected_records)
-        skipped_cap = 0   # MMR loop already respects caps via moment_count_fn
+        skipped_cap = 0
     else:
         # Greedy score-ordered selection (original behaviour)
         sorted_eligible = sorted(

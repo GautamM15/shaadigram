@@ -1,7 +1,11 @@
 ## Last Updated
-2026-04-17 (pre-21k code review fixes — 7 issues resolved)
+2026-04-19 (Phase 3 + Phase 4 full 21k run complete)
 
 ## Current Status
+Phase 4 full run — COMPLETE (2026-04-19)
+  phase4_select.py: 6,831 eligible → 800 selected via MMR (63.61s); solo_portrait 57.5% / group 35.0% / couple 7.5%; all moments unknown (no EXIF); output: selected_photos.json
+Phase 3 full run — COMPLETE (2026-04-19)
+  phase3_score.py: 6,831 photos scored; LAION 6,831/6,831; MUSIQ 6,831/6,831; BRISQUE fallbacks 0; LLaVA fallbacks 48 (0.70%); runtime 66,025s (~18h 20m); output: scored_photos.json (18,588 records)
 Pre-21k code review fixes — COMPLETE (2026-04-17)
   phase2_enrich.py: +--resume flag with checkpoint every 500 photos; fixed save_json arg order at step5 checkpoint
   phase1_filter.py: error logging DEBUG→WARNING; two-tier phash threshold (cross-folder <=4, same-folder <=8); scan_report.json atomic write; warning on 0-path scan_report match
@@ -37,8 +41,8 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 |-------|------|--------|--------|
 | 1 | phase1_filter.py | ✅ Complete | surviving_photos_candid.json |
 | 2 | phase2_enrich.py | ✅ Complete, full run done | enriched_photos_candid.json |
-| 3 | phase3_score.py | ✅ Complete, re-run done (LAION) | scored_photos_candid.json |
-| 4 | phase4_select.py | ✅ Complete | selected_photos_candid.json |
+| 3 | phase3_score.py | ✅ Complete, full 21k run done | scored_photos.json |
+| 4 | phase4_select.py | ✅ Complete, full 21k run done | selected_photos.json |
 | 5 | phase5_review.py | ✅ Complete | review_progress.json + output/album_approved/ (80 approved) |
 | 6 | phase6_export.py | ⏳ Not started | - |
 | - | enroll_face.py | ✅ Complete | {name}_face.pkl |
@@ -56,24 +60,24 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
   - Moments: 8 identified, 1,197 photos with EXIF timestamps; 279 rejected records have none
   - Errors: 0
 - Enrolled persons: none (both gautam_face.pkl and siddharth_face.pkl deleted — enrollments were contaminated)
-- Phase 3 full run (1,477 photos): 74 LLaVA fallbacks, 16,500s (~4h 35m), ~11.2s/photo
-  - LAION: 1,477/1,477 | BRISQUE fallbacks: 0 | LLaVA fallbacks: 74
-  - Score range: 0.2220–0.7821 | Mean: 0.5897 | Median: 0.6114
-  - Candid bonus applied: 64 | Closed-eyes penalty: 0 | Soft-blur penalty: 64 | Distraction penalty: 0
-  - Top photo: FMP00678.jpg at 0.7821
+- Phase 3 CANDID test (1,477 photos): 74 LLaVA fallbacks, 16,500s (~4h 35m), ~11.2s/photo
   - Output: scored_photos_candid.json (1,521 records, 1,477 scored, 44 rejected)
-- Photos scored: 1,477
-- Phase 4 selection (11s):
+- Phase 3 full 21k run (6,831 photos): 48 LLaVA fallbacks (0.70%), 66,025s (~18h 20m), ~9.67s/photo
+  - LAION: 6,831/6,831 | MUSIQ: 6,831/6,831 | BRISQUE fallbacks: 0 | LLaVA fallbacks: 48
+  - Aesthetic blend: BRISQUE×0.20 + LAION×0.40 + MUSIQ×0.40
+  - No burst groups found (step 2c skipped — phase1b may not have found burst groups in this dataset)
+  - Output: scored_photos.json (18,588 total records)
+- Photos scored (full run): 6,831
+- Phase 4 full 21k run (63.61s):
   - Mode: MMR (CLIP diversity, lambda=0.7, 100% embedding coverage)
-  - Top 800 selected: 800/800 (rank 1: FMP00678.jpg score=0.7821, rank 800: TMS09896.jpg score=0.6077)
-  - Moment balancing: all photos moment_label=unknown (no EXIF in CANDID set — no cap applied)
-  - Shot type distribution in top 800: solo_portrait 274 (34.2%), group 273 (34.1%), couple 253 (31.6%)
+  - Top 800 selected: 800/800
+  - Moment balancing: all photos moment_label=unknown (no EXIF — no cap applied)
+  - Shot type distribution: solo_portrait 460 (57.5%), group 280 (35.0%), couple 60 (7.5%)
+  - Note: couple very low vs CANDID run (7.5% vs 31.6%) — dataset may have fewer couple shots
   - No diversity warnings (no type > 60%)
-  - Score distribution: >=0.80: 0 | 0.70-0.79: 109 (13.6%) | 0.60-0.69: 642 (80.2%) | 0.50-0.59: 49 (6.1%)
-  - Mean: 0.6577 | Median: 0.6556
-  - Output: selected_photos_candid.json (1,521 records, in_top800 + selection_rank on every record)
+  - Output: selected_photos.json (18,588 records)
   - Gautam identification removed from phase 4 — done manually in phase 5 review UI
-- Final album selection: 800 (top 800 selected)
+- Final album selection: 800 (top 800 selected, full 21k run)
 - Phase 5 CANDID review (2026-04-17):
   - 800 photos reviewed, 80 approved (10% acceptance rate)
   - 1 person tagged (G=gautam)
@@ -136,17 +140,8 @@ enroll_face.py — COMPLETE (GUI + threaded DeepFace + --list flag)
 ## Next Session Quickstart
 1. Read CLAUDE.md
 2. Read context.md
-3. Read config.py
-4. LAION model: already handled — aesthetic-predictor pip package installed, no weights file needed
-5. Ready for full 21k run. Recommended order:
-   a. python phase1_filter.py --scan-report  (generates scan_report.json — fast, <60s)
-   b. python phase1_filter.py                (full run; reads scan_report.json auto)
-   c. python phase2_enrich.py --input surviving_photos.json --output enriched_photos.json
-      (CLIP step6 runs automatically; use --skip-clip if transformers not installed)
-   d. python phase1b_burst.py --input enriched_photos.json --test  (verify burst groups first)
-   e. python phase1b_burst.py --input enriched_photos.json
-   f. python phase3_score.py --input enriched_photos.json
-      (LAION runs via aesthetic-predictor pip package automatically; no extra flags needed)
-      (add --skip-composition if cv2 saliency module unavailable)
-   g. python phase4_select.py  (MMR if clip_embeddings.npz found; --no-mmr for greedy)
-   h. python phase5_review.py
+3. Phases 1–4 complete on full 21k dataset. Next step:
+   a. python phase5_review.py  (keyboard-driven review of 800 selected photos)
+      - J/K navigate, Space approve, R reject, G tag person
+      - Output: output/album_approved/
+   b. python phase6_export.py  (copy finals to output folders — not yet written)
